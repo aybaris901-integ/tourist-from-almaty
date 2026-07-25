@@ -6,8 +6,27 @@
 export const CONFIG = {
   MIN: 0,
   MAX: 100,
-  AMBIENT_RISE_PER_SEC: 1.5,
   DEBUG_STEP: 10,
+
+  // Economy: fear only ever RISES from an actual threat (missile lock-on,
+  // missile-close proximity, fighter presence, hits — all still driven by
+  // threats.js's own addContinuous/addInstant calls, unchanged). There is no
+  // flat ambient rise anymore — waiting is not what kills you. Whenever
+  // threats.hasActiveThreats() is false ("genuinely calm air"), fear instead
+  // DECAYS at CALM_DECAY_PER_SEC toward a floor that never lets the player
+  // fully relax and gets a little higher deeper into the route:
+  // floor = min(FEAR_FLOOR_BASE + FEAR_FLOOR_PER_WAVE*waveIndex, FEAR_FLOOR_MAX).
+  CALM_DECAY_PER_SEC: 1.5,
+  FEAR_FLOOR_BASE: 15,
+  FEAR_FLOOR_PER_WAVE: 10,
+  FEAR_FLOOR_MAX: 45,
+
+  // Safety valve: fear > 85 with nothing actually attacking is an edge case
+  // (e.g. a fight ends right as fear peaked, decay hasn't caught up yet) —
+  // guarantee a radio lifeline rather than let the player panic from
+  // nothing. See onSafetyValve (route.js wires it to radio.forceCallSoon).
+  SAFETY_VALVE_THRESHOLD: 85,
+  SAFETY_VALVE_CALL_DELAY: 3,
 
   THRESHOLDS: {
     SHAKE: 20, // camera micro-shake, stick tremble, input noise
@@ -67,6 +86,7 @@ export class Fear {
     this.value = 0;
     this.panicActive = false;
     this.panicTimer = 0;
+    this.floor = CONFIG.FEAR_FLOOR_BASE; // recomputed every update(); ui.js's debug overlay reads this directly
 
     // route.js wires both: onPanic fires the instant fear hits 100 (blackout
     // begins — panicActive itself already freezes flight input, see
@@ -75,6 +95,10 @@ export class Fear {
     // value has been reset, to actually run the country-restart sequence.
     this.onPanic = null;
     this.onPanicResolved = null;
+    // Safety valve (see CONFIG.SAFETY_VALVE_THRESHOLD) — route.js wires this
+    // to radio.forceCallSoon().
+    this.onSafetyValve = null;
+    this._safetyValveArmed = false; // edge-triggers once per high-fear-while-calm episode
 
     // Frozen (default true — main.js's MENU state) means every mutation
     // entry point below is a no-op. main.js flips this false on entering
@@ -83,11 +107,19 @@ export class Fear {
     // move fear off 0 while still in the menu.
     this.frozen = true;
 
-    // Continuous sources (lock-on, proximity, fighter presence, ambient,
-    // calm-stretch drain...) are batched and flushed once/sec so tuning logs
-    // stay readable instead of spamming a line every frame.
+    // Continuous sources (lock-on, proximity, fighter presence, calm
+    // decay...) are batched and flushed once/sec so tuning logs stay
+    // readable instead of spamming a line every frame.
     this._logAccum = {};
     this._logTimer = 0;
+
+    // Which continuous sources touched fear THIS frame — cleared at the top
+    // of update(), populated by addContinuous() calls later in the same
+    // frame (threats.js runs after fear.update() in main.js's loop), read by
+    // ui.js's debug overlay (D key) right before it draws. Deliberately
+    // excludes one-off addInstant() events (hits, dodges...) — this is about
+    // ongoing economy forces, not momentary spikes.
+    this._activeSources = new Set();
 
     this._bindDebugKeys();
   }
@@ -108,13 +140,15 @@ export class Fear {
     this._checkPanic();
   }
 
-  // Continuous per-second rate (lock-on, proximity, ambient, calm drain...).
-  // Applied every frame; logged in the once/sec batch via _flushLog.
+  // Continuous per-second rate (lock-on, proximity, fighter presence, calm
+  // decay...). Applied every frame; logged in the once/sec batch via
+  // _flushLog, and tracked in _activeSources for the debug overlay.
   addContinuous(source, perSecond, dt) {
     if (this.frozen) return;
     const amount = perSecond * dt;
     this.value = clamp(this.value + amount, CONFIG.MIN, CONFIG.MAX);
     this._logAccum[source] = (this._logAccum[source] || 0) + amount;
+    this._activeSources.add(source);
     this._checkPanic();
   }
 
@@ -139,6 +173,12 @@ export class Fear {
     return this.value / CONFIG.MAX;
   }
 
+  // ui.js's debug overlay (D key) — continuous sources that touched fear
+  // this frame (see _activeSources / update()).
+  get activeSources() {
+    return Array.from(this._activeSources);
+  }
+
   // 0 at `threshold`, ramping to 1 as value approaches MAX. Used by every
   // consuming system to scale its own effect strength for that layer.
   intensity(threshold) {
@@ -152,7 +192,16 @@ export class Fear {
     return this.panicActive ? 1 : 0;
   }
 
-  update(dt) {
+  // `threatsActive` (threats.hasActiveThreats(), from main.js) gates the
+  // calm decay and safety valve below; `waveIndex` (route.waveIndex) sets
+  // this update's floor. Both reflect the END of the PREVIOUS frame's
+  // threats/route state (main.js calls this before route.update()/
+  // threats.update() run for the current frame) — a one-frame lag that
+  // doesn't matter for a per-second economy.
+  update(dt, threatsActive, waveIndex) {
+    this._activeSources.clear();
+    this.floor = Math.min(CONFIG.FEAR_FLOOR_BASE + CONFIG.FEAR_FLOOR_PER_WAVE * waveIndex, CONFIG.FEAR_FLOOR_MAX);
+
     if (this.panicActive) {
       this.panicTimer -= dt;
       if (this.panicTimer <= 0) {
@@ -164,7 +213,24 @@ export class Fear {
       return;
     }
 
-    this.addContinuous('ambient', CONFIG.AMBIENT_RISE_PER_SEC, dt);
+    if (!threatsActive && this.value > this.floor) {
+      // Decay toward the floor, never past it in one step.
+      const decayed = Math.max(this.floor, this.value - CONFIG.CALM_DECAY_PER_SEC * dt);
+      const delta = decayed - this.value;
+      this.value = decayed;
+      this._logAccum['calm-decay'] = (this._logAccum['calm-decay'] || 0) + delta;
+      this._activeSources.add('calm-decay');
+    }
+
+    if (!this.frozen && !threatsActive && this.value > CONFIG.SAFETY_VALVE_THRESHOLD) {
+      if (!this._safetyValveArmed) {
+        this._safetyValveArmed = true;
+        console.log('[fear] safety valve: high fear with no active threat — forcing a radio call');
+        this.onSafetyValve?.();
+      }
+    } else {
+      this._safetyValveArmed = false;
+    }
 
     this._logTimer += dt;
     if (this._logTimer >= 1) {

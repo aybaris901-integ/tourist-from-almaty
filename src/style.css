@@ -22,12 +22,30 @@ html, body {
   position: absolute;
   inset: 0;
   display: block;
+  z-index: 0;
 }
 
 #hud {
   position: absolute;
   inset: 0;
   pointer-events: none;
+  z-index: 2;
+}
+
+/* Grayed, dimmed freeze-frame of the cockpit at the moment fear.js's panic
+   triggers (see main.js) — sits above the live #scene so the panic screen
+   never shows the world still silently moving underneath, but below #hud so
+   the panic screen's own text/buttons (drawn on the hud canvas) paint on
+   top of it. Invisible (opacity 0) outside the panic-blackout/panic-screen
+   window; z-index 5 blackout is opaque over both while the blackout itself
+   is active, so ordering only matters once blackout fades transparent. */
+#panic-freeze {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0;
+  transition: opacity 0.15s ease;
 }
 
 #blackout {

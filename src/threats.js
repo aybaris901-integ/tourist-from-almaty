@@ -7,32 +7,42 @@ const UP = new THREE.Vector3(0, 1, 0);
 const MISSILE_POOL_SIZE = 5; // headroom for wave 4/5 pairs overlapping a straggler
 const FIGHTER_POOL_SIZE = 2; // wave 5 wants two concurrent fighters
 const PUFF_POOL_SIZE = 4;
+const RADAR_ECHO_POOL_SIZE = 5; // matches MISSILE_POOL_SIZE headroom
 
 // All threat tuning in one place, same convention as fear.js's CONFIG.
 // Fields also documented as "per-wave" are the fallback/default values used
 // before route.js calls setWaveConfig(); route.js's WAVES array overrides
 // them per country.
 export const CONFIG = {
-  // Calm-stretch wave pacing: alternates an active threat phase with a gap.
-  // (per-wave: calm gap length)
+  // Calm-stretch wave pacing: alternates an active threat phase (missiles/
+  // fighters allowed to spawn) with a gap (nothing spawns). No fear side
+  // effect here anymore — fear.js's own calm-decay-toward-floor already
+  // covers this window (and any other genuinely threat-free moment) via
+  // hasActiveThreats() below. (per-wave: calm gap length)
   ACTIVE_MIN: 30,
   ACTIVE_MAX: 50,
   CALM_MIN: 15,
   CALM_MAX: 25,
-  CALM_DRAIN_PER_SEC: 2,
 
   // Missiles. (per-wave: spawn interval, turn rate)
   MISSILE_SPAWN_MIN: 12,
   MISSILE_SPAWN_MAX: 20,
   MISSILE_TURN_RATE: 65, // degrees/s, limited so a hard break can force an overshoot
   MISSILE_LOCKON_DURATION: 1.5,
-  // Spawning ~2500 units out (was 550-900, essentially on top of the player)
-  // means a straight-line approach at the old MISSILE_SPEED (220) would take
-  // ~11s, longer than the old 8s lifetime — speed and lifetime both bumped
-  // so the missile reliably closes the distance and is on-screen long enough
-  // to read, without dragging the encounter out.
-  MISSILE_LIFETIME: 11,
-  MISSILE_SPEED: 340,
+  // Player top speed is BASE_SPEED*THROTTLE_MAX in flight.js (250*1.4 =
+  // 350) — kept in sync manually here since flight.js is off-limits to
+  // edit (see CLAUDE.md). MISSILE_SPEED must always exceed this: outrunning
+  // a missile by throttle alone would make dodging optional, and the whole
+  // point of the fear meter is that you dodge by maneuvering, not fleeing.
+  PLAYER_MAX_SPEED: 350,
+  MISSILE_SPEED: 520,
+  // Lifetime is computed per-missile at launch (see _launchMissile), not a
+  // fixed constant: life = spawnDist / (MISSILE_SPEED - PLAYER_MAX_SPEED) +
+  // MISSILE_LIFETIME_MARGIN. That's the time to close the gap if the player
+  // flies dead straight at full throttle the instant the missile launches —
+  // guarantees a straight-line flier gets hit instead of the missile timing
+  // out first, while a maneuvering player still gets the overshoot/dodge.
+  MISSILE_LIFETIME_MARGIN: 2,
   MISSILE_SPAWN_DIST_MIN: 2200,
   MISSILE_SPAWN_DIST_MAX: 2800,
   MISSILE_SPAWN_ANGLE_MIN: 30, // degrees off the nose
@@ -46,6 +56,44 @@ export const CONFIG = {
   MISSILE_TRAIL_LENGTH: 7, // pooled puffs per missile
   MISSILE_TRAIL_SAMPLE_INTERVAL: 0.045, // seconds between recorded trail points
   RADAR_RANGE: 3000, // ui.js's heading-up radar; also the fighter cutoff below
+  RADAR_ZOOM_RANGE: 1500, // ui.js lerps to this tighter range once a missile is close
+  RADAR_ZOOM_TRIGGER_DIST: 1200,
+  // Separate from the 3D exhaust trail above (MISSILE_TRAIL_LENGTH), which
+  // only spans ~0.3s and lives in world space near the mesh. This is a
+  // longer, radar-only history of recent positions so the 2D dot on the HUD
+  // shows where the missile has BEEN, independent of how the 3D view reads.
+  RADAR_TRAIL_DURATION: 1.5,
+  RADAR_TRAIL_SAMPLE_INTERVAL: 0.08,
+  // How long an expired missile's radar dot flashes grey and fades — the
+  // only on-radar confirmation that a dodge/near-miss/clean expiry just
+  // happened, since the 3D puff can be off-screen or hard to place.
+  RADAR_ECHO_DURATION: 1,
+
+  // Dodge-window telegraph (per-wave: dodgeWindowEnter/dodgeWindowBreak,
+  // missileSpeed): tells the player exactly when a hard break will work,
+  // instead of leaving the timing a guess. Entering DODGE_WINDOW_ENTER
+  // starts a distinct rising tone + a pulsing radar dot; crossing
+  // DODGE_WINDOW_BREAK flashes the "BREAK!" crosshair cue. These are the
+  // fallback defaults; route.js's WAVES widens/slows wave 1 and tightens
+  // later waves.
+  DODGE_WINDOW_ENTER: 700,
+  DODGE_WINDOW_BREAK: 500,
+  // Forgiving dodge check: from the moment the window opens, ANY hard yank
+  // of the stick — roll or pitch, either direction — permanently breaks the
+  // missile's lock (see _updateDodgeWindow/_updatePlayerAngularState).
+  // Deliberately not a "turn correctly" check: a new player doesn't know
+  // which way is right, so any decisive input counts, with one exception —
+  // swinging the nose INTO the missile's own flight direction (within
+  // DODGE_INTO_MISSILE_EXCLUDE_DEG) doesn't count, since that's turning
+  // toward its path, not away from it, and shouldn't read as evasion.
+  DODGE_ANGULAR_VELOCITY_THRESHOLD: 90, // deg/s, combined roll-rate + pitch-rate magnitude
+  DODGE_INTO_MISSILE_EXCLUDE_DEG: 15,
+
+  // Kazakhstan's scripted first missile (see route.js/spawnScriptedMissile):
+  // it can never actually hit — failing to dodge in time forces a big,
+  // harmless near-miss instead, so onboarding never costs a real hit.
+  SCRIPTED_MISSILE_LIFETIME: 18, // fixed, not the geometric formula: this missile can be slower than the player, which that formula assumes never happens
+  SCRIPTED_FAIL_FEAR: 20,
 
   FEAR_LOCKON_PER_SEC: 6,
   FEAR_CLOSE_PER_SEC: 12,
@@ -179,10 +227,27 @@ export class Threats {
     this._missileSpawnMin = CONFIG.MISSILE_SPAWN_MIN;
     this._missileSpawnMax = CONFIG.MISSILE_SPAWN_MAX;
     this._missileTurnRate = THREE.MathUtils.degToRad(CONFIG.MISSILE_TURN_RATE);
+    this._missileSpeed = CONFIG.MISSILE_SPEED;
+    this._dodgeWindowEnter = CONFIG.DODGE_WINDOW_ENTER;
+    this._dodgeWindowBreak = CONFIG.DODGE_WINDOW_BREAK;
     this._missilesPerSpawn = 1;
     this._maxMissilesThisWave = Infinity;
     this._missilesThisWave = 0;
     this._nextMissileTimer = randRange(this._missileSpawnMin, this._missileSpawnMax);
+    this._breakCuePending = false; // one-shot flag, drained by ui.js via consumeBreakCue()
+    this._scriptedResult = null; // one-shot 'success'|'fail', drained by route.js via consumeScriptedResult()
+    this.dodgeCount = 0; // total successful dodges this session — ui.js drops the BREAK cue's arrows past 3
+
+    // Player angular-velocity tracking for the forgiving dodge check (see
+    // _updatePlayerAngularState/_updateDodgeWindow) — frame-to-frame deltas
+    // of flight.roll/pitch/forward, since flight.js exposes positions, not
+    // rates.
+    this._prevRoll = 0;
+    this._prevPitch = 0;
+    this._prevForward = new THREE.Vector3(0, 0, -1);
+    this._headingDelta = new THREE.Vector3();
+    this._headingDeltaValid = false;
+    this._angularVelDeg = 0;
 
     this._maxFighters = 0;
     this._fighterCanShoot = false;
@@ -192,6 +257,8 @@ export class Threats {
       trail: Array.from({ length: CONFIG.MISSILE_TRAIL_LENGTH }, () => createTrailPuff()),
       trailHistory: [],
       trailTimer: 0,
+      radarTrailHistory: [], // { pos: Vector3, age: seconds since sampled }, oldest-last
+      radarTrailTimer: 0,
       active: false,
       state: 'idle',
       lockTimer: 0,
@@ -200,6 +267,12 @@ export class Threats {
       position: new THREE.Vector3(),
       direction: new THREE.Vector3(),
       minDistance: Infinity,
+      dodgeWindowState: 'none', // 'none' -> 'entered' -> 'broken', see _updateDodgeWindow
+      lockLost: false, // set once a hard turn is detected inside the dodge window; freezes homing
+      scripted: false, // Kazakhstan's scripted tutorial missile — see spawnScriptedMissile
+      scriptedSpeed: 0,
+      scriptedWindowEnter: 0,
+      scriptedWindowBreak: 0,
     }));
     for (const m of this._missiles) {
       scene.add(m.mesh);
@@ -212,6 +285,15 @@ export class Threats {
       timer: 0,
       duration: 0,
     }));
+
+    // Radar-only "echo" markers: no 3D mesh, just a world position + timer
+    // that ui.js's radar draws as a fading grey dot when a missile expires
+    // (see _resolveExpiry / _spawnRadarEcho).
+    this._radarEchoes = Array.from({ length: RADAR_ECHO_POOL_SIZE }, () => ({
+      active: false,
+      timer: 0,
+      position: new THREE.Vector3(),
+    }));
     for (const p of this._puffs) scene.add(p.mesh);
 
     this._fighters = Array.from({ length: FIGHTER_POOL_SIZE }, () => ({
@@ -223,6 +305,7 @@ export class Threats {
       orbitRadius: 0,
       prevPos: new THREE.Vector3(),
       burstTimer: 0,
+      inFront: false, // mirrors _updateFighters' local `inFront`, so hasActiveThreats() can read it
     }));
     for (const f of this._fighters) scene.add(f.mesh);
   }
@@ -234,6 +317,9 @@ export class Threats {
     this._missileSpawnMin = wave.missileSpawnMin;
     this._missileSpawnMax = wave.missileSpawnMax;
     this._missileTurnRate = THREE.MathUtils.degToRad(wave.missileTurnRate);
+    this._missileSpeed = wave.missileSpeed ?? CONFIG.MISSILE_SPEED;
+    this._dodgeWindowEnter = wave.dodgeWindowEnter ?? CONFIG.DODGE_WINDOW_ENTER;
+    this._dodgeWindowBreak = wave.dodgeWindowBreak ?? CONFIG.DODGE_WINDOW_BREAK;
     this._missilesPerSpawn = wave.missilesPerSpawn || 1;
     this._maxMissilesThisWave = wave.missileCount ?? Infinity;
     this._missilesThisWave = 0;
@@ -276,15 +362,14 @@ export class Threats {
     this._updateSlowmo(dt);
     this._updateWave(dt);
 
-    if (this._wavePhase === 'calm') {
-      fear.addContinuous('calm-drain', -CONFIG.CALM_DRAIN_PER_SEC, dt);
-    } else {
+    if (this._wavePhase !== 'calm') {
       this._updateMissileSpawning(dt, flight);
     }
 
     this._updateMissiles(dt, gameDt, flight, fear, radio);
     this._updateFighters(dt, gameDt, flight, fear);
     this._updatePuffs(gameDt);
+    this._updateRadarEchoes(gameDt);
   }
 
   _updateSlowmo(dt) {
@@ -369,14 +454,50 @@ export class Threats {
     slot.minDistance = Infinity;
     slot.trailHistory.length = 0;
     slot.trailTimer = 0;
+    slot.radarTrailHistory.length = 0;
+    slot.radarTrailTimer = 0;
+    slot.dodgeWindowState = 'none';
+    slot.lockLost = false;
+    slot.scripted = false;
 
     this.audio.startLockTone();
     console.log('[threats] lock-on warning');
   }
 
+  // route.js drives Kazakhstan's scripted dodge tutorial through this
+  // instead of the generic random-timer spawner (that wave's missileCount
+  // is 0). Overrides this one missile's speed and dodge-window thresholds
+  // relative to whatever the wave's own values are (see setWaveConfig) — the
+  // multipliers are the wave's scriptedTutorial config in route.js.
+  spawnScriptedMissile(flight, { speedMultiplier, windowMultiplier }) {
+    const slot = this._missiles.find((m) => !m.active);
+    if (!slot) return;
+    this._beginLockOn(slot, flight);
+    slot.scripted = true;
+    slot.scriptedSpeed = this._missileSpeed * speedMultiplier;
+    slot.scriptedWindowEnter = this._dodgeWindowEnter * windowMultiplier;
+    slot.scriptedWindowBreak = this._dodgeWindowBreak * windowMultiplier;
+  }
+
+  // One-shot result drained by route.js's tutorial state machine — null
+  // while the scripted missile is still in flight (or none has spawned
+  // yet), 'success' or 'fail' the frame it resolves.
+  consumeScriptedResult() {
+    const result = this._scriptedResult;
+    this._scriptedResult = null;
+    return result;
+  }
+
   _launchMissile(m, flight) {
     m.state = 'homing';
-    m.lifeTimer = CONFIG.MISSILE_LIFETIME;
+    if (m.scripted) {
+      // Fixed, not the geometric formula — a slow scripted missile can be
+      // slower than the player, which that formula assumes never happens.
+      m.lifeTimer = CONFIG.SCRIPTED_MISSILE_LIFETIME;
+    } else {
+      const spawnDist = m.spawnPos.distanceTo(flight.position);
+      m.lifeTimer = spawnDist / (this._missileSpeed - CONFIG.PLAYER_MAX_SPEED) + CONFIG.MISSILE_LIFETIME_MARGIN;
+    }
     m.position.copy(m.spawnPos);
     m.direction.copy(flight.position).sub(m.position).normalize();
     m.mesh.position.copy(m.position);
@@ -399,7 +520,95 @@ export class Threats {
     return THREE.MathUtils.clamp(rel.dot(flatRight) / dist, -1, 1);
   }
 
+  // Solves the classic pursuit-triangle quadratic for the time at which a
+  // `speed`-fast missile starting at missilePos would meet the player if the
+  // player held their current velocity (flight.forward * flight.speed)
+  // indefinitely: |delta + v*t| = speed*t, i.e.
+  // (v.v - s^2)t^2 + 2(delta.v)t + delta.delta = 0. For a normal missile
+  // (always faster than the player's max speed) a real positive root always
+  // exists (verified: a<0, c>=0 => roots have opposite sign, so exactly one
+  // positive root when delta != 0); the scripted tutorial missile can be
+  // SLOWER than the player (a>=0), where that guarantee doesn't hold, hence
+  // the `<= 0` guard falling back to interceptTime=0 (aim at raw position).
+  _leadIntercept(missilePos, flight, speed) {
+    const playerVel = flight.forward.clone().multiplyScalar(flight.speed);
+    const delta = flight.position.clone().sub(missilePos);
+    const a = playerVel.lengthSq() - speed * speed;
+    const b = 2 * delta.dot(playerVel);
+    const c = delta.lengthSq();
+    const disc = b * b - 4 * a * c;
+    let interceptTime = 0;
+    if (disc >= 0 && Math.abs(a) > 1e-6) {
+      const sq = Math.sqrt(disc);
+      const t1 = (-b + sq) / (2 * a);
+      const t2 = (-b - sq) / (2 * a);
+      if (t1 > 0 && t2 > 0) interceptTime = Math.min(t1, t2);
+      else if (t1 > 0) interceptTime = t1;
+      else if (t2 > 0) interceptTime = t2;
+    }
+    return flight.position.clone().addScaledVector(playerVel, interceptTime);
+  }
+
+  // Frame-to-frame angular-velocity tracking for the forgiving dodge check.
+  // flight.js exposes roll/pitch/forward as positions, not rates, so the
+  // rate has to be diffed here — computed once per frame (not once per
+  // missile) and read by every missile's _updateDodgeWindow call this frame.
+  _updatePlayerAngularState(dt, flight) {
+    if (dt <= 0) return;
+    const rollRate = (flight.roll - this._prevRoll) / dt;
+    const pitchRate = (flight.pitch - this._prevPitch) / dt;
+    this._angularVelDeg = THREE.MathUtils.radToDeg(Math.hypot(rollRate, pitchRate));
+
+    this._headingDelta.copy(flight.forward).sub(this._prevForward);
+    this._headingDeltaValid = this._headingDelta.lengthSq() > 1e-10;
+    if (this._headingDeltaValid) this._headingDelta.normalize();
+
+    this._prevRoll = flight.roll;
+    this._prevPitch = flight.pitch;
+    this._prevForward.copy(flight.forward);
+  }
+
+  // Dodge-window telegraph: as a homing missile closes past its dodge-window
+  // enter range, cue the player (rising tone; getRadarContacts' flag lets
+  // ui.js pulse the dot) — past the break range, flash the crosshair
+  // "BREAK!" cue once (ui.js drains it via consumeBreakCue()). From the
+  // moment the window opens, ANY hard yank of the stick (roll or pitch,
+  // either direction — see _updatePlayerAngularState) sets lockLost, which
+  // the homing loop uses to stop correcting entirely for the rest of this
+  // missile's life. The one exception: swinging the nose INTO the missile's
+  // own flight direction doesn't count (see DODGE_INTO_MISSILE_EXCLUDE_DEG).
+  _updateDodgeWindow(m, dist) {
+    const enterRange = m.scripted ? m.scriptedWindowEnter : this._dodgeWindowEnter;
+    const breakRange = m.scripted ? m.scriptedWindowBreak : this._dodgeWindowBreak;
+
+    if (m.dodgeWindowState === 'none' && dist <= enterRange) {
+      m.dodgeWindowState = 'entered';
+      this.audio.playDodgeCue();
+    }
+    if (m.dodgeWindowState === 'entered' && dist <= breakRange) {
+      m.dodgeWindowState = 'broken';
+      this._breakCuePending = true;
+    }
+
+    if (m.lockLost || m.dodgeWindowState === 'none') return;
+    if (this._angularVelDeg < CONFIG.DODGE_ANGULAR_VELOCITY_THRESHOLD) return;
+    if (this._headingDeltaValid) {
+      const towardMissileDeg = THREE.MathUtils.radToDeg(this._headingDelta.angleTo(m.direction));
+      if (towardMissileDeg <= CONFIG.DODGE_INTO_MISSILE_EXCLUDE_DEG) return;
+    }
+    m.lockLost = true;
+  }
+
+  // One-shot flag drained by ui.js each frame — true at most once per
+  // missile crossing into the "BREAK!" range.
+  consumeBreakCue() {
+    const pending = this._breakCuePending;
+    this._breakCuePending = false;
+    return pending;
+  }
+
   _updateMissiles(dt, gameDt, flight, fear, radio) {
+    this._updatePlayerAngularState(dt, flight);
     let anyLockOn = false;
     const flatForward = flight.forward.clone().setY(0).normalize();
     const flatRight = flatForward.clone().cross(UP);
@@ -424,22 +633,48 @@ export class Threats {
         continue;
       }
 
-      // Homing: turn-rate-limited pursuit of the player's current position.
-      const desired = flight.position.clone().sub(m.position).normalize();
-      const angle = m.direction.angleTo(desired);
-      if (angle > 1e-4) {
-        const axis = new THREE.Vector3().crossVectors(m.direction, desired);
-        if (axis.lengthSq() > 1e-8) {
-          axis.normalize();
-          const turn = Math.min(angle, this._missileTurnRate * gameDt);
-          m.direction.applyAxisAngle(axis, turn).normalize();
+      const speed = m.scripted ? m.scriptedSpeed : this._missileSpeed;
+
+      // Dodge-window telegraph + lock-loss check, using last frame's
+      // distance (this frame's hasn't been computed yet) so the cue lands on
+      // the same frame the player would perceive the threshold being crossed.
+      this._updateDodgeWindow(m, m.position.distanceTo(flight.position));
+
+      // Homing: turn-rate-limited pursuit of a PREDICTED intercept point, not
+      // the player's raw current position. Pure pursuit (chasing "where they
+      // are right now") needs ever-tighter curvature as the gap closes, and
+      // at a bounded turn rate that can fail to converge at all for some
+      // spawn geometries — verified by simulating this exact loop offline:
+      // wave 1's 45deg/s turn rate never caught a dead-straight flier from
+      // some spawn angles, no matter how long the missile's lifetime was.
+      // Leading the target keeps the required turn budget roughly constant
+      // through the whole chase, which is what actually makes "fly straight
+      // = get hit" true. this._leadIntercept solves the classic
+      // closing-triangle quadratic each frame using the player's current
+      // velocity; it falls back to the player's raw position (old behavior)
+      // if no positive-time solution exists.
+      // Once lockLost (a hard yank during the dodge window, see
+      // _updateDodgeWindow), turning stops entirely — the missile just keeps
+      // its current heading, which is what turns "overshoot" from "usually"
+      // into "guaranteed" for a player who breaks on cue.
+      if (!m.lockLost) {
+        const desired = this._leadIntercept(m.position, flight, speed).sub(m.position).normalize();
+        const angle = m.direction.angleTo(desired);
+        if (angle > 1e-4) {
+          const axis = new THREE.Vector3().crossVectors(m.direction, desired);
+          if (axis.lengthSq() > 1e-8) {
+            axis.normalize();
+            const turn = Math.min(angle, this._missileTurnRate * gameDt);
+            m.direction.applyAxisAngle(axis, turn).normalize();
+          }
         }
       }
-      m.position.addScaledVector(m.direction, CONFIG.MISSILE_SPEED * gameDt);
+      m.position.addScaledVector(m.direction, speed * gameDt);
       m.mesh.position.copy(m.position);
       m.mesh.quaternion.setFromUnitVectors(FORWARD, m.direction);
       m.lifeTimer -= gameDt;
       this._updateTrail(m, gameDt);
+      this._updateRadarTrail(m, gameDt);
 
       const dist = m.position.distanceTo(flight.position);
       m.minDistance = Math.min(m.minDistance, dist);
@@ -507,7 +742,45 @@ export class Threats {
     }
   }
 
+  // Radar-only position history, independent of the 3D exhaust trail above:
+  // ages every recorded sample every frame and drops anything past
+  // RADAR_TRAIL_DURATION, so ui.js's radar can draw a ~1.5s fading path for
+  // the dot regardless of what the 3D trail (which only spans ~0.3s) is doing.
+  _updateRadarTrail(m, gameDt) {
+    for (const p of m.radarTrailHistory) p.age += gameDt;
+    while (m.radarTrailHistory.length && m.radarTrailHistory[m.radarTrailHistory.length - 1].age > CONFIG.RADAR_TRAIL_DURATION) {
+      m.radarTrailHistory.pop();
+    }
+    m.radarTrailTimer -= gameDt;
+    if (m.radarTrailTimer <= 0) {
+      m.radarTrailTimer = CONFIG.RADAR_TRAIL_SAMPLE_INTERVAL;
+      m.radarTrailHistory.unshift({ pos: m.position.clone(), age: 0 });
+    }
+  }
+
+  // Radar-only fading marker left behind when a missile expires (dodge,
+  // near-miss, or clean) — the only on-radar confirmation that the missile
+  // is gone and didn't just fly off the edge of the display.
+  _spawnRadarEcho(position) {
+    const slot = this._radarEchoes.find((e) => !e.active) || this._radarEchoes[0];
+    slot.active = true;
+    slot.timer = CONFIG.RADAR_ECHO_DURATION;
+    slot.position.copy(position);
+  }
+
+  _updateRadarEchoes(gameDt) {
+    for (const e of this._radarEchoes) {
+      if (!e.active) continue;
+      e.timer -= gameDt;
+      if (e.timer <= 0) e.active = false;
+    }
+  }
+
   _resolveHit(m, flight, fear) {
+    if (m.scripted) {
+      this._resolveScriptedFail(m, flight, fear);
+      return;
+    }
     fear.addInstant('missile-hit', CONFIG.FEAR_HIT_INSTANT);
     flight.triggerTumble(CONFIG.TUMBLE_DURATION);
     flight.triggerImpactShake(CONFIG.IMPACT_SHAKE_DURATION, CONFIG.IMPACT_SHAKE_MAG);
@@ -519,7 +792,24 @@ export class Threats {
     console.log('[threats] HIT');
   }
 
+  // Kazakhstan's scripted first missile can never actually hit — failing to
+  // dodge in time instead forces a big, scary-but-harmless near-miss (shake
+  // + fear, no tumble) so a brand-new player never eats a real hit during
+  // onboarding. route.js reads the result via consumeScriptedResult() and
+  // schedules a retry.
+  _resolveScriptedFail(m, flight, fear) {
+    fear.addInstant('scripted-tutorial-fail', CONFIG.SCRIPTED_FAIL_FEAR);
+    flight.triggerImpactShake(CONFIG.IMPACT_SHAKE_DURATION, CONFIG.IMPACT_SHAKE_MAG);
+    this.audio.playImpactThud();
+    this._spawnPuff(m.position, 0xff6644);
+    this._spawnRadarEcho(m.position);
+    this._scriptedResult = 'fail';
+    this._despawnMissile(m);
+    console.log('[threats] scripted tutorial: forced near-miss (no dodge)');
+  }
+
   _resolveExpiry(m, fear, radio) {
+    const scripted = m.scripted;
     if (m.minDistance <= CONFIG.MISSILE_NEAR_MISS_RADIUS) {
       fear.addInstant('near-miss-explosion', CONFIG.FEAR_NEAR_MISS_INSTANT);
       this._spawnPuff(m.position, 0xff6644);
@@ -527,13 +817,20 @@ export class Threats {
       fear.addInstant('successful-dodge', -CONFIG.FEAR_DODGE_INSTANT);
       this._spawnPuff(m.position, 0xffffff);
       this.audio.playWhoosh();
+      this.audio.playDodgeSting();
       this._triggerSlowmo();
       radio.notifyDodge();
+      this.dodgeCount += 1;
       console.log('[threats] dodge!');
     } else {
       this._spawnPuff(m.position, 0xffffff);
     }
+    this._spawnRadarEcho(m.position);
     this._despawnMissile(m);
+    // Any non-hit resolution counts as tutorial success, not just the
+    // "successful-dodge" branch above — surviving is what the scripted
+    // sequence is checking for, not the exact closest-approach bucket.
+    if (scripted) this._scriptedResult = 'success';
   }
 
   _despawnMissile(m) {
@@ -543,6 +840,8 @@ export class Threats {
     for (const s of m.trail) s.visible = false;
     m.trailHistory.length = 0;
     m.trailTimer = 0;
+    m.radarTrailHistory.length = 0;
+    m.radarTrailTimer = 0;
   }
 
   // Called by route.js when a fear-100 panic resolves into a country
@@ -616,6 +915,7 @@ export class Threats {
       const dist = toFighter.length();
       const flatForward = flight.forward.clone().setY(0).normalize();
       const inFront = dist > 1 && dist < CONFIG.FIGHTER_VISIBLE_RANGE && flatForward.dot(toFighter.normalize()) > 0;
+      f.inFront = inFront; // hasActiveThreats() reads this
 
       if (inFront) {
         fear.addContinuous('fighter-presence', CONFIG.FEAR_FIGHTER_PER_SEC, dt);
@@ -706,8 +1006,10 @@ export class Threats {
   // player's forward axis IS the display's vertical axis, no rotation logic
   // needed beyond this dot-product projection. dirRight/dirForward give a
   // homing missile's travel direction for the velocity tick; null for
-  // fighters and for missiles still locking on (nothing moving yet).
-  getRadarContacts(flight) {
+  // fighters and for missiles still locking on (nothing moving yet). `range`
+  // is passed in (not CONFIG.RADAR_RANGE directly) so ui.js's auto-zoom can
+  // request contacts against whatever range it's currently displaying.
+  getRadarContacts(flight, range = CONFIG.RADAR_RANGE) {
     const results = [];
     const flatForward = flight.forward.clone().setY(0).normalize();
     const flatRight = flatForward.clone().cross(UP);
@@ -722,8 +1024,16 @@ export class Threats {
       if (!m.active) continue;
       const targetPos = m.state === 'lockon' ? m.spawnPos : m.position;
       const p = project(targetPos);
-      if (p.dist < 1 || p.dist > CONFIG.RADAR_RANGE) continue;
+      if (p.dist < 1 || p.dist > range) continue;
       const homing = m.state === 'homing';
+      // Fading path of recent positions, oldest last — only meaningful once
+      // homing (lock-on hasn't moved yet).
+      const trail = homing
+        ? m.radarTrailHistory.map((h) => {
+            const tp = project(h.pos);
+            return { localRight: tp.right, localForward: tp.forward, alpha: 1 - h.age / CONFIG.RADAR_TRAIL_DURATION };
+          })
+        : [];
       results.push({
         type: 'missile',
         localRight: p.right,
@@ -731,16 +1041,62 @@ export class Threats {
         warning: !homing,
         dirRight: homing ? m.direction.dot(flatRight) : null,
         dirForward: homing ? m.direction.dot(flatForward) : null,
+        trail,
+        dodgeWindow: m.dodgeWindowState !== 'none', // ui.js pulses the dot while true
       });
     }
 
     for (const f of this._fighters) {
       if (!f.active) continue;
       const p = project(f.mesh.position);
-      if (p.dist < 1 || p.dist > CONFIG.RADAR_RANGE) continue;
-      results.push({ type: 'fighter', localRight: p.right, localForward: p.forward, warning: false, dirRight: null, dirForward: null });
+      if (p.dist < 1 || p.dist > range) continue;
+      results.push({ type: 'fighter', localRight: p.right, localForward: p.forward, warning: false, dirRight: null, dirForward: null, trail: [], dodgeWindow: false });
+    }
+
+    for (const e of this._radarEchoes) {
+      if (!e.active) continue;
+      const p = project(e.position);
+      if (p.dist < 1 || p.dist > range) continue;
+      results.push({
+        type: 'echo',
+        localRight: p.right,
+        localForward: p.forward,
+        warning: false,
+        dirRight: null,
+        dirForward: null,
+        trail: [],
+        alpha: e.timer / CONFIG.RADAR_ECHO_DURATION,
+      });
     }
 
     return results;
+  }
+
+  // Closest active homing missile's straight-line distance, or Infinity if
+  // none — ui.js's radar uses this to decide when to auto-zoom in.
+  nearestHomingMissileDist(flight) {
+    let best = Infinity;
+    for (const m of this._missiles) {
+      if (!m.active || m.state !== 'homing') continue;
+      const d = m.position.distanceTo(flight.position);
+      if (d < best) best = d;
+    }
+    return best;
+  }
+
+  // "Genuinely calm air": true while any missile is locking-on or homing, or
+  // any fighter is currently in front — main.js reads this once per frame
+  // (before fear.update()) and it's what gates fear.js's calm-decay-toward-
+  // floor and safety valve. Broader than "currently adding continuous fear
+  // right now" on purpose: a homing missile still 2000 units out isn't yet
+  // within MISSILE_CLOSE_RADIUS, but it's absolutely not calm air either.
+  hasActiveThreats() {
+    for (const m of this._missiles) {
+      if (m.active && (m.state === 'lockon' || m.state === 'homing')) return true;
+    }
+    for (const f of this._fighters) {
+      if (f.active && f.inFront) return true;
+    }
+    return false;
   }
 }

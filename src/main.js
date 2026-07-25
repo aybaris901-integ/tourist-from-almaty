@@ -15,6 +15,8 @@ const hudCanvas = document.getElementById('hud');
 const fpsElement = document.getElementById('fps-counter');
 const hint = document.getElementById('pointer-lock-hint');
 const blackout = document.getElementById('blackout');
+const panicFreezeCanvas = document.getElementById('panic-freeze');
+const panicFreezeCtx = panicFreezeCanvas.getContext('2d');
 
 const renderer = new THREE.WebGLRenderer({ canvas: sceneCanvas, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -34,7 +36,7 @@ const postfx = new PostFX(renderer, scene, camera);
 const audio = new FearAudio();
 const threats = new Threats(scene, audio);
 const radio = new Radio(audio);
-const route = new Route(threats, world, radio, fear);
+const route = new Route(threats, world, radio, fear, audio);
 
 // --- Game state machine: MENU -> FLYING (-> PAUSED later) -----------------
 // In MENU, world/flight/cockpit idle-render but fear/radio/threats/route
@@ -77,17 +79,33 @@ function resize() {
   postfx.resize(width, height);
   ui.resize(width, height, dpr);
   cockpit.resize();
+
+  panicFreezeCanvas.width = Math.round(width * dpr);
+  panicFreezeCanvas.height = Math.round(height * dpr);
+  panicFreezeCanvas.style.width = `${width}px`;
+  panicFreezeCanvas.style.height = `${height}px`;
 }
 window.addEventListener('resize', resize);
 resize();
 
 window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyF') ui.toggleFps();
+  if (e.code === 'KeyD') ui.toggleDebug();
+  // Panic screen (route.phase === 'restart-flash') is the only place these
+  // fire — see ui.js's panic screen and route.js's retryFromPanic().
+  if (route.phase === 'restart-flash') {
+    if (e.code === 'Enter') route.retryFromPanic();
+    // No separate menu scene exists yet (MENU is just this same page before
+    // its first click-to-fly) — reloading is the simplest correct way back
+    // to it, and Escape already force-exits pointer lock regardless.
+    if (e.code === 'Escape') window.location.reload();
+  }
 });
 
 const clock = new THREE.Clock();
 let fpsAccum = 0;
 let fpsFrames = 0;
+let wasPanicking = false; // edge-detects the instant fear.panicActive turns true, to capture the freeze-frame exactly once
 
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
@@ -97,17 +115,33 @@ renderer.setAnimationLoop(() => {
     // gameplay motion uses gameDt, scheduling/fear/UI/audio stay on real dt.
     const gameDt = dt * threats.timeScale;
 
-    fear.update(dt);
-    route.update(dt);
+    // hasActiveThreats() reflects the end of the PREVIOUS frame's
+    // threats.update() (which runs below, after fear.update()) — a
+    // one-frame lag that doesn't matter for a per-second fear economy.
+    fear.update(dt, threats.hasActiveThreats(), route.waveIndex);
+    route.update(dt, flight);
     threats.update(dt, gameDt, flight, fear, radio);
-    radio.update(dt, fear);
+    radio.update(dt, fear, route.waveIndex);
     flight.update(gameDt, fear);
     world.update(flight.position, gameDt);
     cockpit.update(flight.stick, fear, gameDt);
-    ui.update(flight, fear, dt, threats, radio, route);
+    ui.update(flight, fear, dt, threats, radio, route, audio);
     audio.update(dt, fear);
     blackout.style.opacity = fear.panicBlackAlpha;
     postfx.render(dt, fear.normalized);
+
+    // Grab the panic screen's freeze-frame on the exact frame the blackout
+    // begins — sceneCanvas still holds this frame's just-rendered pixels
+    // (drawImage on a WebGL canvas works without preserveDrawingBuffer as
+    // long as it happens before the browser composites/clears, i.e. later
+    // in this same callback — which this is).
+    if (fear.panicActive && !wasPanicking) {
+      panicFreezeCtx.filter = 'grayscale(0.7) brightness(0.45)';
+      panicFreezeCtx.drawImage(sceneCanvas, 0, 0, panicFreezeCanvas.width, panicFreezeCanvas.height);
+      panicFreezeCtx.filter = 'none';
+    }
+    wasPanicking = fear.panicActive;
+    panicFreezeCanvas.style.opacity = fear.panicActive || route.phase === 'restart-flash' ? '1' : '0';
   } else {
     // MENU: world/flight idle so the backdrop isn't a frozen frame, but no
     // fear/radio/threats/route ticking, no HUD, no post-processing.

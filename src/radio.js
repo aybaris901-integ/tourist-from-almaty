@@ -1,4 +1,5 @@
 import { randRange } from './utils.js';
+import RADIO_LINES from './radio_lines.json';
 
 export const CONFIG = {
   CALL_INTERVAL_MIN: 25,
@@ -11,25 +12,12 @@ export const CONFIG = {
   HIGH_FEAR_INTERVAL_MULT: 0.8,
 };
 
-// Placeholder lines; real voice/writing is a later pass.
-const LINES = [
-  {
-    prompt: 'Unknown caller: "Do you have ANY idea how much airspace you are violating right now?"',
-    options: ['[funny reply A]', '[funny reply B]', '[funny reply C]'],
-  },
-  {
-    prompt: 'Unknown caller: "Sir. Sir. This is NOT a drill, sir."',
-    options: ['[funny reply A]', '[funny reply B]', '[funny reply C]'],
-  },
-  {
-    prompt: 'Unknown caller: "We have missile lock. Please respond."',
-    options: ['[funny reply A]', '[funny reply B]', '[funny reply C]'],
-  },
-  {
-    prompt: 'Unknown caller: "That was a stolen F-22 you just barrel-rolled, correct?"',
-    options: ['[funny reply A]', '[funny reply B]', '[funny reply C]'],
-  },
-];
+// route.js's WAVES index -> radio_lines.json country tag. Regular (random)
+// calls are pulled from whichever pool matches the CURRENT wave, so Bagdat
+// only shows up over Kazakhstan and the NATO pilot takes over from
+// Azerbaijan on — scripted lines (kazakhstan_intro, tutorial, panic) use
+// their own tags and are never picked at random (see _startCall).
+const COUNTRY_TAGS = ['kazakhstan', 'azerbaijan', 'georgia', 'turkey', 'istanbul'];
 
 // Radio calls are a scarce, player-managed resource: answering costs
 // attention (you keep flying while reading) but pays off in fear relief.
@@ -46,6 +34,7 @@ export class Radio {
     this._nextCallTimer = randRange(CONFIG.CALL_INTERVAL_MIN, CONFIG.CALL_INTERVAL_MAX);
     this._fear = null;
     this._forcedLine = null;
+    this._waveIndex = 0; // updated each frame via update()'s waveIndex param
 
     this._bindKeys();
   }
@@ -69,11 +58,20 @@ export class Radio {
   // A clean dodge hurries up the next call (never delays it beyond whatever
   // was already scheduled).
   notifyDodge() {
-    this._nextCallTimer = Math.min(this._nextCallTimer, CONFIG.POST_DODGE_DELAY);
+    this.forceCallSoon(CONFIG.POST_DODGE_DELAY);
   }
 
-  update(dt, fear) {
+  // Pulls the next call in to within `delay` seconds (never delays it beyond
+  // whatever was already scheduled) without forcing any particular line —
+  // used by notifyDodge() and by fear.js's safety valve (high fear with no
+  // active threat) via route.js.
+  forceCallSoon(delay) {
+    this._nextCallTimer = Math.min(this._nextCallTimer, delay);
+  }
+
+  update(dt, fear, waveIndex) {
     this._fear = fear;
+    this._waveIndex = waveIndex;
     if (this._cooldownTimer > 0) this._cooldownTimer -= dt;
 
     if (this.active) {
@@ -97,13 +95,15 @@ export class Radio {
   }
 
   _startCall() {
-    const line = this._forcedLine || LINES[Math.floor(Math.random() * LINES.length)];
+    const pool = RADIO_LINES.filter((l) => l.tags?.includes(COUNTRY_TAGS[this._waveIndex]));
+    const line = this._forcedLine || pool[Math.floor(Math.random() * pool.length)];
     this._forcedLine = null;
     this.subtitle = line.prompt;
     this.options = line.options;
     this.active = true;
     this.answerTimer = CONFIG.ANSWER_WINDOW;
-    this.audio.playRadioBlip();
+    this.audio.setMusicDucked(true);
+    this.audio.playVoiceLine(line.speaker, line.prompt.length);
     console.log('[radio] incoming call');
   }
 
@@ -118,6 +118,7 @@ export class Radio {
     this.active = false;
     this.subtitle = '';
     this.options = [];
+    this.audio.setMusicDucked(false);
     this._cooldownTimer = CONFIG.COOLDOWN;
     this._nextCallTimer = this._rollNextCallInterval();
   }
