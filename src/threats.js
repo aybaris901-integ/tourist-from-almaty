@@ -1,11 +1,14 @@
 import * as THREE from 'three';
-import { randRange, TOON_GRADIENT } from './utils.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { clone as cloneSkinned } from 'three/addons/utils/SkeletonUtils.js';
+import { randRange, smoothDamp, TOON_GRADIENT } from './utils.js';
 
 const FORWARD = new THREE.Vector3(0, 0, -1);
 const UP = new THREE.Vector3(0, 1, 0);
 
 const MISSILE_POOL_SIZE = 5; // headroom for wave 4/5 pairs overlapping a straggler
-const FIGHTER_POOL_SIZE = 2; // wave 5 wants two concurrent fighters
+const FIGHTER_POOL_SIZE = 3; // wave 5 wants two concurrent fighters; headroom to test a third without tanking fps
+const TRACER_POOL_SIZE = 8; // up to a few fighters bursting in overlapping windows
 const PUFF_POOL_SIZE = 4;
 const RADAR_ECHO_POOL_SIZE = 5; // matches MISSILE_POOL_SIZE headroom
 
@@ -117,24 +120,146 @@ export const CONFIG = {
   PUFF_DURATION: 0.4,
   PUFF_MAX_SCALE: 60,
 
-  // Fighter: presence + (from Georgia on) short gun bursts. (per-wave: count)
-  FIGHTER_SPAWN_MIN: 20,
+  // Fighter: real model (fighter.glb), loaded once and cloned per pool slot
+  // (see _loadFighterModel/_attachFighterModel) — never loaded per fighter.
+  // Per-instance state machine: PATROL (lazy orbit, presence fear) ->
+  // ATTACK (swing to the player's rear quarter, telegraphed line-up, tracer
+  // burst) -> COOLDOWN (breaks away) -> back to PATROL. (per-wave: count,
+  // fighterCanAttack, attack interval, accuracy — see route.js's WAVES;
+  // PATROL-only until a wave sets fighterCanAttack.)
+  FIGHTER_MODEL_URL: '/models/fighter.glb',
+  // This particular export is ~900 world units long (Sketchfab FBX scale
+  // artifact) — the file's native scale is never trusted. On load the
+  // bounding box's longest dimension is measured and the whole model
+  // rescaled so nose-to-tail equals this constant.
+  FIGHTER_LENGTH: 40,
+  // Sketchfab_model/RootNode bakes an FBX rotation the glTF export didn't
+  // undo — this is the wrapper yaw (radians) that points the nose down our
+  // -Z forward convention (see FORWARD below). Tune by eye — fighter must
+  // fly nose-first — with the KeyG/KeyH debug keys (_bindFighterDebugKeys);
+  // the fix lives on the wrapper only, never on the AI's own heading math.
+  FIGHTER_MODEL_YAW_OFFSET: 0,
+  FIGHTER_TRI_WARN: 15000, // per-instance triangle budget warning
+  FIGHTER_TOTAL_TRI_WARN: 45000, // rough scene-budget warning (draw calls/vertex processing still scale per instance even with shared geometry)
+  FIGHTER_SPAWN_MIN: 20, // end-of-lifetime rotation delay: a fighter left, wait a while before the next one
   FIGHTER_SPAWN_MAX: 35,
+  // Distinct, MUCH shorter delay used only when a fighter is forced out by
+  // _enterCalm (see below) — it reappears promptly once the active phase
+  // resumes, not after a fresh 20-35s roll. Without this, _enterCalm using
+  // FIGHTER_SPAWN_MIN/MAX (or worse, leaving the fighter's already-elapsed
+  // spawnTimer untouched, which was the actual shipped bug) meant the
+  // fighter either vanished for a full active phase or popped back INSTANTLY
+  // at a brand-new random position the moment calm ended — a jarring
+  // "teleport."
+  FIGHTER_RESPAWN_DELAY_MIN: 2,
+  FIGHTER_RESPAWN_DELAY_MAX: 5,
   FIGHTER_LIFETIME_MIN: 25,
   FIGHTER_LIFETIME_MAX: 40,
-  FIGHTER_ORBIT_MIN: 500,
-  FIGHTER_ORBIT_MAX: 900,
-  FIGHTER_ORBIT_SPEED: 0.12,
-  FIGHTER_STEER_RATE: 0.6,
+  // Movement model: every state (PATROL/ATTACK/COOLDOWN) computes a target
+  // point, then _steerFighter() flies toward it like an aircraft, not a
+  // camera — heading turns at a bounded rate and position always advances
+  // along that same heading (see _steerFighter). This is deliberate, not
+  // just style: an earlier version used an exponential position-lerp
+  // ("teleport a fraction of the way toward target each frame") with
+  // orientation derived separately from the position delta. Against a
+  // target that itself moves at player speed, that lerp's steady-state lag
+  // is proportional to playerSpeed/lerpRate — easily hundreds of units, so
+  // the fighter visibly fell behind and "wandered off." Flying along its
+  // own heading instead makes nose == velocity true by construction (no
+  // separate derivation to get out of sync) and bounds the lag to whatever
+  // the speed/turn-rate budget below actually allows.
+  FIGHTER_ORBIT_MIN: 800, // PATROL escort radius
+  FIGHTER_ORBIT_MAX: 1200,
+  // rad/s the escort anchor sweeps across the front arc. This has to stay
+  // small: the anchor's OWN tangential speed from sweeping is
+  // radius*sweepSpeed (up to 1200*sweepSpeed), and that has to leave
+  // headroom under the patrol speed budget (1.05-1.15x player speed) on top
+  // of whatever speed is already needed just to match the player's own
+  // translation. The original 0.12 gave up to 144 units/s of tangential
+  // speed alone — combined with tracking translation that regularly
+  // exceeded the whole budget (especially at low player throttle), so the
+  // fighter could never actually keep pace with its own anchor and ended up
+  // wandering wherever it could, including behind the player. 0.025 keeps
+  // the tangential contribution to ~30 units/s at max radius, comfortably
+  // trackable so the front-hemisphere bias is something the player actually
+  // SEES, not just something the anchor math technically satisfies.
+  FIGHTER_ORBIT_SWEEP_SPEED: 0.025,
+  // PATROL/escort anchor's RESTING zone stays within +/-this many degrees
+  // of the player's OWN nose (bearing, not a world-fixed angle). 120 was
+  // "front hemisphere" by math but well outside the cockpit canopy's real
+  // sightline (~+/-55 deg horizontally, above the dashboard) — the fighter
+  // could sit at your 9 o'clock, front arc by the numbers, invisible by
+  // glass. 45 keeps the resting anchor comfortably inside what you can
+  // actually see through the canopy; it can still swing wider mid-maneuver
+  // (ATTACK's rear-quarter approach, COOLDOWN's breakaway — neither reads
+  // this constant), just not at rest.
+  FIGHTER_VISIBLE_ARC_DEG: 45,
+  // PATROL/escort anchor's resting altitude, relative to the player — kept
+  // consistently ABOVE (never oscillating through 0) so it silhouettes
+  // against the sky in the upper canopy instead of getting cut off by the
+  // dashboard or side struts. Randomized per fighter at spawn (see
+  // f.altitudeOffset) for a little vertical variety between escorts.
+  FIGHTER_ALTITUDE_OFFSET_MIN: 50,
+  FIGHTER_ALTITUDE_OFFSET_MAX: 150,
+  FIGHTER_TURN_RATE_DEG: 75, // heading turn rate, all states
+  // PATROL's steady-state "holding formation" speed vs. the player's
+  // CURRENT speed — always slightly faster, never snaps. NOT used for
+  // closing a gap (see FIGHTER_CLOSING_DIST/FIGHTER_BRISK_SPEED_MULT
+  // below): a 5-15% speed edge alone gives a pursuer chasing a
+  // similarly-fast, laterally-drifting target (the escort anchor also
+  // inherits the player's translation) so little closing power, combined
+  // with the bounded turn rate, that it settles into a stable but LOOSE
+  // orbit at nearly the full escort radius away from the anchor — never
+  // actually arriving, and easily ending up outside the front bias as a
+  // result. This speed is only for once it's already close.
+  FIGHTER_PATROL_SPEED_MULT_MIN: 1.05,
+  FIGHTER_PATROL_SPEED_MULT_MAX: 1.15,
+  // Distance from the CURRENT target point past which a fighter uses
+  // FIGHTER_BRISK_SPEED_MULT instead of its normal per-state speed,
+  // regardless of state — this is what actually lets PATROL close the gap
+  // to its escort slot instead of permanently trailing it (see above).
+  // Once within this radius the fighter drops back to the gentler
+  // per-state speed, so it settles into formation instead of oscillating.
+  FIGHTER_CLOSING_DIST: 300,
+  FIGHTER_BRISK_SPEED_MULT: 1.35, // closing distance, ATTACK closing/lineup/burst, COOLDOWN breakaway
+  FIGHTER_CATCHUP_DIST: 2000, // straight-line distance from the PLAYER past which...
+  FIGHTER_CATCHUP_SPEED_MULT: 1.4, // ...this multiplier overrides everything else, until back in range
   FIGHTER_VISIBLE_RANGE: 3000,
-  FEAR_FIGHTER_PER_SEC: 3,
+  FEAR_FIGHTER_PER_SEC: 3, // PATROL/COOLDOWN/closing presence, front hemisphere only
+  FIGHTER_MAX_BANK_DEG: 60,
+  FIGHTER_BANK_GAIN: 1.4, // converts yaw rate (rad/s) into a bank angle target
+  FIGHTER_BANK_SMOOTH_TIME: 0.35,
+  FIGHTER_TRAIL_LENGTH: 14, // 2x MISSILE_TRAIL_LENGTH — readability layer, independent of the real model
+  FIGHTER_TRAIL_SAMPLE_INTERVAL: 0.045,
 
-  // Gun bursts (per-wave: enabled via fighterCanShoot). A hit is deliberately
-  // lighter than a missile hit: shorter tumble/shake, and +10 fear instead
-  // of +45 — still a real threat over multiple bursts, not a one-shot.
-  GUN_BURST_INTERVAL_MIN: 3,
-  GUN_BURST_INTERVAL_MAX: 6,
-  GUN_HIT_CHANCE: 0.3,
+  // ATTACK: swing to the player's rear quarter, then a telegraphed line-up
+  // (rattle cue + orange radar dot) before a tracer burst. Resolution
+  // (hit/near-miss) is decided at line-up's end but only takes effect after
+  // ATTACK_TRACER_TRAVEL_TIME into the burst — tracers travel, this isn't
+  // hitscan.
+  ATTACK_REAR_DIST_MIN: 300,
+  ATTACK_REAR_DIST_MAX: 500,
+  ATTACK_REAR_ANGLE_MIN: 20, // degrees off dead-astern, either side — a "quarter", not directly behind
+  ATTACK_REAR_ANGLE_MAX: 55,
+  ATTACK_CLOSING_TIMEOUT: 6, // safety net: abort to COOLDOWN if the slot is never reached
+  ATTACK_SLOT_RADIUS: 180, // close enough to the ideal rear-quarter point to call it "in position"
+  ATTACK_LINEUP_DURATION: 2,
+  ATTACK_BURST_DURATION: 1,
+  ATTACK_TRACER_TRAVEL_TIME: 0.35, // seconds into the burst before the shot resolves
+  ATTACK_TRACER_SPAWN_INTERVAL: 0.1,
+  ATTACK_TRACER_SPEED: 1600,
+  ATTACK_TRACER_HIT_SPREAD: 20, // aim jitter around the player when the roll says "hit"
+  ATTACK_TRACER_MISS_SPREAD: 160, // aim offset when the roll says "miss" — a clean, readable near-miss
+  FEAR_FIGHTER_LINEUP_PER_SEC: 8, // being lined up on is scarier than mere presence
+  COOLDOWN_MIN: 8,
+  COOLDOWN_MAX: 12,
+  ATTACK_INTERVAL_MIN: 12, // fallback if a wave doesn't set fighterAttackIntervalMin/Max
+  ATTACK_INTERVAL_MAX: 20,
+  ATTACK_ACCURACY_DEFAULT: 0.3,
+
+  // A hit is deliberately lighter than a missile hit: shorter tumble/shake,
+  // and +10 fear instead of +45 — still a real threat over multiple bursts,
+  // not a one-shot.
   FEAR_GUN_NEAR_MISS_INSTANT: 8,
   FEAR_GUN_HIT_INSTANT: 10,
   GUN_HIT_TUMBLE_DURATION: 1,
@@ -186,9 +311,23 @@ function createTrailPuff() {
   return sprite;
 }
 
-function createFighterMesh() {
+// Shown inside each fighter's group until the real model (fighter.glb,
+// loaded once — see _loadFighterModel) finishes loading and gets swapped in;
+// keeps the pool spawnable from frame one instead of blocking on the async
+// load.
+function createFighterPlaceholder() {
   const geo = new THREE.BoxGeometry(30, 12, 40);
   const mat = new THREE.MeshToonMaterial({ color: 0x777d85, gradientMap: TOON_GRADIENT, fog: true });
+  return new THREE.Mesh(geo, mat);
+}
+
+// Visible tracer streak for a fighter's gun burst — travels from the
+// fighter to its aim point over ATTACK_TRACER_SPEED (see _spawnTracer),
+// which is what makes the burst read as "not hitscan."
+function createTracerMesh() {
+  const geo = new THREE.BoxGeometry(2, 2, 24);
+  geo.rotateX(-Math.PI / 2); // long axis now local -Z, aligned with FORWARD
+  const mat = new THREE.MeshBasicMaterial({ color: 0xfff3b0, fog: true });
   const mesh = new THREE.Mesh(geo, mat);
   mesh.visible = false;
   return mesh;
@@ -250,7 +389,18 @@ export class Threats {
     this._angularVelDeg = 0;
 
     this._maxFighters = 0;
-    this._fighterCanShoot = false;
+    this._fighterCanAttack = false;
+    this._fighterAttackMin = CONFIG.ATTACK_INTERVAL_MIN;
+    this._fighterAttackMax = CONFIG.ATTACK_INTERVAL_MAX;
+    this._fighterAccuracy = CONFIG.ATTACK_ACCURACY_DEFAULT;
+
+    // Real fighter model: loaded once, cloned into every pool slot once
+    // ready (see _loadFighterModel/_attachFighterModel). Not skinned in the
+    // current export (no <skin> in fighter.glb) but detected dynamically —
+    // SkeletonUtils.clone() only for a skinned source, plain clone()
+    // otherwise, per the loader contract.
+    this._fighterTemplate = null;
+    this._fighterSkinned = false;
 
     this._missiles = Array.from({ length: MISSILE_POOL_SIZE }, () => ({
       mesh: createMissileMesh(),
@@ -296,18 +446,64 @@ export class Threats {
     }));
     for (const p of this._puffs) scene.add(p.mesh);
 
-    this._fighters = Array.from({ length: FIGHTER_POOL_SIZE }, () => ({
-      mesh: createFighterMesh(),
+    this._tracers = Array.from({ length: TRACER_POOL_SIZE }, () => ({
+      mesh: createTracerMesh(),
       active: false,
-      spawnTimer: randRange(CONFIG.FIGHTER_SPAWN_MIN, CONFIG.FIGHTER_SPAWN_MAX),
-      lifeTimer: 0,
-      orbitAngle: 0,
-      orbitRadius: 0,
-      prevPos: new THREE.Vector3(),
-      burstTimer: 0,
-      inFront: false, // mirrors _updateFighters' local `inFront`, so hasActiveThreats() can read it
+      dir: new THREE.Vector3(),
+      speed: 0,
+      traveled: 0,
+      maxDist: 0,
     }));
-    for (const f of this._fighters) scene.add(f.mesh);
+    for (const t of this._tracers) scene.add(t.mesh);
+
+    this._fighters = Array.from({ length: FIGHTER_POOL_SIZE }, () => {
+      const placeholder = createFighterPlaceholder();
+      const group = new THREE.Group();
+      group.add(placeholder);
+      group.visible = false;
+      return {
+        mesh: group,
+        modelPlaceholder: placeholder,
+        modelInstance: null, // real model clone, swapped in once _fighterTemplate is ready (see _attachFighterModel)
+        active: false,
+        state: 'patrol', // 'patrol' | 'attack' | 'cooldown'
+        attackPhase: null, // 'closing' | 'lineup' | 'burst', only meaningful while state==='attack'
+        spawnTimer: randRange(CONFIG.FIGHTER_SPAWN_MIN, CONFIG.FIGHTER_SPAWN_MAX),
+        lifeTimer: 0,
+        orbitAngle: 0,
+        orbitRadius: 0,
+        patrolSpeedMult: 1.1, // randomized per-spawn within FIGHTER_PATROL_SPEED_MULT_MIN/MAX
+        altitudeOffset: 100, // randomized per-spawn within FIGHTER_ALTITUDE_OFFSET_MIN/MAX
+        heading: new THREE.Vector3(0, 0, -1), // unit vector — position always advances along this, so nose == velocity by construction (see _steerFighter)
+        bank: 0,
+        bankVel: { value: 0 },
+        _diagPrevPos: new THREE.Vector3(), // debug-overlay only: lets getFighterDebugInfo report real vel-vs-heading divergence
+        inFront: false,
+        threatening: false, // hasActiveThreats() reads this: front-hemisphere presence OR any ATTACK phase
+        radarLineup: false, // ui.js's radar draws an orange dot while true
+        attackTimer: 0, // PATROL countdown to the next attack attempt
+        attackSide: 1,
+        attackAngle: 0,
+        attackDist: 0,
+        closingTimer: 0,
+        lineupTimer: 0,
+        burstTimer: 0,
+        burstJustStarted: false, // one-shot flag for the gun-burst sound cue
+        attackHit: false, // decided at line-up's end; tracer aim + the delayed resolution both read it
+        tracerSpawnTimer: 0,
+        cooldownTimer: 0,
+        trail: Array.from({ length: CONFIG.FIGHTER_TRAIL_LENGTH }, () => createTrailPuff()),
+        trailHistory: [],
+        trailTimer: 0,
+      };
+    });
+    for (const f of this._fighters) {
+      scene.add(f.mesh);
+      for (const s of f.trail) scene.add(s);
+    }
+
+    this._loadFighterModel();
+    this._bindFighterDebugKeys();
   }
 
   // Called by route.js at every country transition (and left untouched on a
@@ -326,7 +522,10 @@ export class Threats {
     this._nextMissileTimer = randRange(this._missileSpawnMin, this._missileSpawnMax);
 
     this._maxFighters = wave.fighterCount ?? 0;
-    this._fighterCanShoot = !!wave.fighterCanShoot;
+    this._fighterCanAttack = !!wave.fighterCanAttack;
+    this._fighterAttackMin = wave.fighterAttackIntervalMin ?? CONFIG.ATTACK_INTERVAL_MIN;
+    this._fighterAttackMax = wave.fighterAttackIntervalMax ?? CONFIG.ATTACK_INTERVAL_MAX;
+    this._fighterAccuracy = wave.fighterAccuracy ?? CONFIG.ATTACK_ACCURACY_DEFAULT;
 
     this._calmMin = wave.calmMin;
     this._calmMax = wave.calmMax;
@@ -342,12 +541,23 @@ export class Threats {
   // to resolve naturally (hit/dodge/near-miss) — its bounded 8s lifetime
   // fits inside any calm window this short, so cutting it off would only
   // rob the player of a dodge payoff without buying anything.
+  //
+  // MUST go through _despawnFighter (not just active=false/visible=false
+  // inline) — that's what resets spawnTimer. Fighters never reset it
+  // themselves on spawn, so an inline hide here left it holding whatever
+  // near-zero/negative value it had from before the fighter was already
+  // flying; the instant calm ended, _updateFighters saw spawnTimer<=0 and
+  // respawned it THAT SAME FRAME at a brand-new random position — the
+  // "portal teleport" players were seeing. FIGHTER_RESPAWN_DELAY_MIN/MAX
+  // (a couple seconds, not the full end-of-lifetime 20-35s) keeps it
+  // reappearing promptly once the active phase resumes.
   _enterCalm(duration) {
     this._wavePhase = 'calm';
     this._waveTimer = duration;
     for (const f of this._fighters) {
-      f.active = false;
-      f.mesh.visible = false;
+      if (!f.active) continue;
+      this._despawnFighter(f);
+      f.spawnTimer = randRange(CONFIG.FIGHTER_RESPAWN_DELAY_MIN, CONFIG.FIGHTER_RESPAWN_DELAY_MAX);
     }
   }
 
@@ -368,6 +578,7 @@ export class Threats {
 
     this._updateMissiles(dt, gameDt, flight, fear, radio);
     this._updateFighters(dt, gameDt, flight, fear);
+    this._updateTracers(gameDt);
     this._updatePuffs(gameDt);
     this._updateRadarEchoes(gameDt);
   }
@@ -849,10 +1060,10 @@ export class Threats {
   // that was already tracking them pre-blackout.
   clearAllThreats() {
     for (const m of this._missiles) this._despawnMissile(m);
-    for (const f of this._fighters) {
-      f.active = false;
-      f.mesh.visible = false;
-      f.spawnTimer = randRange(CONFIG.FIGHTER_SPAWN_MIN, CONFIG.FIGHTER_SPAWN_MAX);
+    for (const f of this._fighters) this._despawnFighter(f);
+    for (const t of this._tracers) {
+      t.active = false;
+      t.mesh.visible = false;
     }
   }
 
@@ -882,78 +1093,350 @@ export class Threats {
     }
   }
 
+  // --- Fighter model loading (load once, clone per pool slot) -------------
+
+  _loadFighterModel() {
+    const loader = new GLTFLoader();
+    loader.load(
+      CONFIG.FIGHTER_MODEL_URL,
+      (gltf) => this._onFighterModelLoaded(gltf),
+      undefined,
+      (err) => console.error('[threats] failed to load fighter.glb:', err)
+    );
+  }
+
+  // Toon-shaded to match the rest of the world (same treatment as
+  // cockpit.js's _styleMaterials), base colors kept. Styled ONCE on the
+  // shared template — every per-instance clone below just references these
+  // same material objects, so this never runs per fighter.
+  _styleFighterMaterials(model) {
+    model.traverse((child) => {
+      if (!child.isMesh || !child.material) return;
+      const materials = Array.isArray(child.material) ? child.material : [child.material];
+      const next = materials.map((old) => {
+        const mat = new THREE.MeshToonMaterial({
+          color: old.color ? old.color.clone() : 0xffffff,
+          map: old.map || null,
+          gradientMap: TOON_GRADIENT,
+          transparent: old.transparent,
+          opacity: old.opacity,
+          alphaTest: old.alphaTest || 0,
+          emissive: 0x000000,
+          fog: true, // outdoor, unlike the cockpit interior
+        });
+        old.dispose();
+        return mat;
+      });
+      child.material = Array.isArray(child.material) ? next : next[0];
+    });
+  }
+
+  _onFighterModelLoaded(gltf) {
+    const model = gltf.scene;
+    model.updateMatrixWorld(true);
+    this._styleFighterMaterials(model);
+
+    let triCount = 0;
+    let meshCount = 0;
+    let skinned = false;
+    model.traverse((child) => {
+      if (!child.isMesh) return;
+      meshCount++;
+      if (child.isSkinnedMesh) skinned = true;
+      const geo = child.geometry;
+      triCount += geo.index ? geo.index.count / 3 : geo.attributes.position.count / 3;
+    });
+    triCount = Math.round(triCount);
+    console.log(`[threats] loaded fighter.glb — ${triCount} tris across ${meshCount} meshes`);
+    if (triCount > CONFIG.FIGHTER_TRI_WARN) {
+      console.warn(`[threats] fighter.glb is ${triCount} tris — over the ${CONFIG.FIGHTER_TRI_WARN}-tri per-instance budget`);
+    }
+    if (triCount * FIGHTER_POOL_SIZE > CONFIG.FIGHTER_TOTAL_TRI_WARN) {
+      console.warn(
+        `[threats] ${FIGHTER_POOL_SIZE}x fighter.glb ~= ${triCount * FIGHTER_POOL_SIZE} tris — over the ${CONFIG.FIGHTER_TOTAL_TRI_WARN} scene budget (draw calls/vertex processing scale per instance even though geometry is shared)`
+      );
+    }
+
+    // SCALE NORMALIZATION: this file's native scale is never trusted (~900
+    // world units long as exported) — measure the bbox and rescale so the
+    // longest dimension (nose to tail) equals FIGHTER_LENGTH.
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    const length = Math.max(size.x, size.y, size.z) || 1;
+    model.scale.setScalar(CONFIG.FIGHTER_LENGTH / length);
+
+    // FORWARD AXIS: baked FBX rotations live on the imported hierarchy
+    // (Sketchfab_model/RootNode) — wrap it in our own Group and rotate THAT
+    // to point the nose down -Z (FORWARD, same convention as missiles). The
+    // fix lives on this wrapper only; the AI's own heading math never
+    // changes.
+    const wrapper = new THREE.Group();
+    wrapper.rotation.y = CONFIG.FIGHTER_MODEL_YAW_OFFSET;
+    wrapper.add(model);
+
+    this._fighterTemplate = wrapper;
+    this._fighterSkinned = skinned;
+
+    // Any pool slots that already exist (all of them — the pool is built
+    // up-front in the constructor) get the real model swapped in for their
+    // placeholder box now, whether currently active or not.
+    for (const f of this._fighters) this._attachFighterModel(f);
+  }
+
+  _attachFighterModel(f) {
+    if (!this._fighterTemplate || f.modelInstance) return;
+    const instance = this._fighterSkinned ? cloneSkinned(this._fighterTemplate) : this._fighterTemplate.clone();
+    f.mesh.remove(f.modelPlaceholder);
+    f.mesh.add(instance);
+    f.modelInstance = instance;
+  }
+
+  // Dev aid for tuning FIGHTER_MODEL_YAW_OFFSET by eye (CLAUDE.md: "verify
+  // visually, fix the wrapper, never the AI"). KeyG/KeyH nudge the wrapper
+  // yaw ±15° on the template (so future clones inherit it) and on every
+  // already-attached instance, logging the new offset in degrees.
+  _bindFighterDebugKeys() {
+    window.addEventListener('keydown', (e) => {
+      if (e.code !== 'KeyG' && e.code !== 'KeyH') return;
+      const step = THREE.MathUtils.degToRad(15) * (e.code === 'KeyG' ? -1 : 1);
+      CONFIG.FIGHTER_MODEL_YAW_OFFSET += step;
+      if (this._fighterTemplate) this._fighterTemplate.rotation.y = CONFIG.FIGHTER_MODEL_YAW_OFFSET;
+      for (const f of this._fighters) {
+        if (f.modelInstance) f.modelInstance.rotation.y = CONFIG.FIGHTER_MODEL_YAW_OFFSET;
+      }
+      console.log(`[threats] FIGHTER_MODEL_YAW_OFFSET = ${THREE.MathUtils.radToDeg(CONFIG.FIGHTER_MODEL_YAW_OFFSET).toFixed(0)}deg`);
+    });
+  }
+
+  // --- Fighter state machine: PATROL -> ATTACK -> COOLDOWN -> PATROL ------
+
   _updateFighters(dt, gameDt, flight, fear) {
+    const flatForward = flight.forward.clone().setY(0).normalize();
+    const flatRight = flatForward.clone().cross(UP);
+
+    let nearestEngineDist = Infinity;
+    let engineFighter = null;
+
     for (const f of this._fighters) {
       if (!f.active) {
         if (!this.spawningEnabled || this._wavePhase === 'calm') continue;
-        f.spawnTimer -= dt;
+        // Only counts down while actually eligible to spawn (a free slot
+        // exists) — the pool has more slots than most waves ever use at
+        // once (FIGHTER_POOL_SIZE headroom), so the unused slots would
+        // otherwise drain their spawnTimer deeply negative while sitting
+        // blocked behind maxFighters, then spawn INSTANTLY — at a fresh
+        // random position, unrelated to wherever the fighter that just left
+        // was — the moment a vacancy finally opened. That read as a
+        // same-frame teleport to a different fighter.
         const activeCount = this._fighters.filter((x) => x.active).length;
-        if (f.spawnTimer <= 0 && activeCount < this._maxFighters) {
+        if (activeCount >= this._maxFighters) continue;
+        f.spawnTimer -= dt;
+        if (f.spawnTimer <= 0) {
           this._spawnFighter(f, flight);
         }
         continue;
       }
 
       f.lifeTimer -= dt;
-      f.orbitAngle += CONFIG.FIGHTER_ORBIT_SPEED * gameDt;
-      const target = flight.position.clone().add(
-        new THREE.Vector3(
-          Math.cos(f.orbitAngle) * f.orbitRadius,
-          Math.sin(f.orbitAngle * 0.6) * 150,
-          Math.sin(f.orbitAngle) * f.orbitRadius
-        )
-      );
-      f.mesh.position.lerp(target, 1 - Math.exp(-CONFIG.FIGHTER_STEER_RATE * gameDt));
 
-      const vel = f.mesh.position.clone().sub(f.prevPos);
-      if (vel.lengthSq() > 1e-6) {
-        f.mesh.quaternion.setFromUnitVectors(FORWARD, vel.normalize());
-      }
-      f.prevPos.copy(f.mesh.position);
-
-      const toFighter = f.mesh.position.clone().sub(flight.position);
-      const dist = toFighter.length();
-      const flatForward = flight.forward.clone().setY(0).normalize();
-      const inFront = dist > 1 && dist < CONFIG.FIGHTER_VISIBLE_RANGE && flatForward.dot(toFighter.normalize()) > 0;
-      f.inFront = inFront; // hasActiveThreats() reads this
-
-      if (inFront) {
-        fear.addContinuous('fighter-presence', CONFIG.FEAR_FIGHTER_PER_SEC, dt);
-        if (this._fighterCanShoot) {
-          f.burstTimer -= dt;
-          if (f.burstTimer <= 0) {
-            this._resolveGunBurst(flight, fear);
-            f.burstTimer = randRange(CONFIG.GUN_BURST_INTERVAL_MIN, CONFIG.GUN_BURST_INTERVAL_MAX);
-          }
+      let targetPos;
+      let speedMult;
+      if (f.state === 'patrol') {
+        targetPos = this._patrolTarget(f, gameDt, flight);
+        speedMult = f.patrolSpeedMult;
+        if (this._fighterCanAttack) {
+          f.attackTimer -= dt;
+          if (f.attackTimer <= 0) this._beginAttack(f);
+        }
+      } else if (f.state === 'attack') {
+        targetPos = this._updateAttack(f, dt, gameDt, flight, fear, flatRight);
+        speedMult = CONFIG.FIGHTER_BRISK_SPEED_MULT;
+      } else {
+        targetPos = this._cooldownTarget(f, flight);
+        speedMult = CONFIG.FIGHTER_BRISK_SPEED_MULT; // brisk breakaway, not a lazy drift
+        f.cooldownTimer -= dt;
+        if (f.cooldownTimer <= 0) {
+          f.state = 'patrol';
+          f.orbitAngle = Math.random() * Math.PI * 2;
+          f.orbitRadius = randRange(CONFIG.FIGHTER_ORBIT_MIN, CONFIG.FIGHTER_ORBIT_MAX);
+          f.attackTimer = randRange(this._fighterAttackMin, this._fighterAttackMax);
         }
       }
 
-      if (f.lifeTimer <= 0) {
-        f.active = false;
-        f.mesh.visible = false;
-        f.spawnTimer = randRange(CONFIG.FIGHTER_SPAWN_MIN, CONFIG.FIGHTER_SPAWN_MAX);
-        console.log('[threats] fighter leaves');
+      this._steerFighter(f, targetPos, flight, gameDt, speedMult);
+      this._updateFighterTrail(f, gameDt);
+
+      const toFighter = f.mesh.position.clone().sub(flight.position);
+      const dist = toFighter.length();
+      const inFront = dist > 1 && dist < CONFIG.FIGHTER_VISIBLE_RANGE && flatForward.dot(toFighter.clone().normalize()) > 0;
+      const lineupActive = f.state === 'attack' && f.attackPhase === 'lineup';
+      f.inFront = inFront;
+      // hasActiveThreats() reads this: an attacking fighter is a real threat
+      // even while approaching from behind (outside the front-hemisphere
+      // check below), which is the whole point of a rear-quarter attack.
+      f.threatening = f.state === 'attack' || inFront;
+
+      const presencePhase = f.state === 'patrol' || f.state === 'cooldown' || (f.state === 'attack' && f.attackPhase === 'closing');
+      if (inFront && presencePhase) {
+        fear.addContinuous('fighter-presence', CONFIG.FEAR_FIGHTER_PER_SEC, dt);
       }
+      if (lineupActive) {
+        fear.addContinuous('fighter-lineup', CONFIG.FEAR_FIGHTER_LINEUP_PER_SEC, dt);
+      }
+      if (f.burstJustStarted) {
+        this.audio.playGunBurst(this._panFor(f.mesh.position, flight, flatRight));
+        f.burstJustStarted = false;
+      }
+
+      if (dist < CONFIG.FIGHTER_VISIBLE_RANGE && dist < nearestEngineDist) {
+        nearestEngineDist = dist;
+        engineFighter = { dist, pan: this._panFor(f.mesh.position, flight, flatRight) };
+      }
+
+      // Mid-attack fighters ignore their lifetime clock — cutting an attack
+      // off mid-line-up/burst would rob the payoff without buying anything;
+      // COOLDOWN's own timer (or the next PATROL loop) despawns it instead.
+      if (f.lifeTimer <= 0 && f.state !== 'attack') {
+        this._despawnFighter(f);
+      }
+    }
+
+    if (engineFighter) {
+      this.audio.startFighterEngine();
+      const proximity = 1 - THREE.MathUtils.clamp(engineFighter.dist / CONFIG.FIGHTER_VISIBLE_RANGE, 0, 1);
+      this.audio.updateFighterEngine(engineFighter.pan, proximity);
+    } else {
+      this.audio.stopFighterEngine();
     }
   }
 
-  _spawnFighter(f, flight) {
-    f.active = true;
-    f.lifeTimer = randRange(CONFIG.FIGHTER_LIFETIME_MIN, CONFIG.FIGHTER_LIFETIME_MAX);
-    f.orbitAngle = Math.random() * Math.PI * 2;
-    f.orbitRadius = randRange(CONFIG.FIGHTER_ORBIT_MIN, CONFIG.FIGHTER_ORBIT_MAX);
-    f.burstTimer = randRange(CONFIG.GUN_BURST_INTERVAL_MIN, CONFIG.GUN_BURST_INTERVAL_MAX);
-    f.mesh.position.copy(flight.position).add(new THREE.Vector3(f.orbitRadius, 0, 0));
-    f.prevPos.copy(f.mesh.position);
-    f.mesh.visible = true;
-    console.log('[threats] fighter appears');
+  // flight.forward can be a zero vector before flight.js has ever run its
+  // own update() once (e.g. a fighter can spawn on the very first frame,
+  // before that) — THREE.Vector3.normalize() on a zero-length vector
+  // silently stays zero instead of throwing, and a zero direction anywhere
+  // in the fighter steering chain (spawn bearing, PATROL/ATTACK target,
+  // heading) can never fix itself afterward (see _steerFighter's own
+  // degenerate-heading guard for the other half of this). Every fighter
+  // target/spawn calculation that flattens flight.forward goes through
+  // here instead of inlining `.clone().setY(0).normalize()`, so there's one
+  // place that catches it, not three copies of the same latent bug.
+  _safeFlatForward(flight) {
+    const flat = flight.forward.clone().setY(0);
+    return flat.lengthSq() > 1e-6 ? flat.normalize() : new THREE.Vector3(0, 0, -1);
   }
 
-  // Georgia onward: fighters fire short bursts. A hit is lighter than a
-  // missile hit (fear, tumble, shake all reduced) but still counts as "any
-  // hit" for the post-hit lock-on immunity.
-  _resolveGunBurst(flight, fear) {
-    if (Math.random() < CONFIG.GUN_HIT_CHANCE) {
+  // Player-relative escort point, recomputed fresh off flight.position/
+  // flight.forward every frame (a moving anchor, not a world-fixed ellipse —
+  // that was the earlier bug: the old version built the offset directly in
+  // world X/Z, so it didn't track the player's facing at all). The bearing
+  // sweeps sinusoidally within +/-FIGHTER_VISIBLE_ARC_DEG of the player's
+  // OWN nose — narrow enough to stay inside the cockpit canopy's real
+  // sightline, not just "front hemisphere" by the math — and the altitude
+  // stays consistently ABOVE the player (f.altitudeOffset, set at spawn) so
+  // it silhouettes against the sky instead of getting cut off by the
+  // dashboard or side struts. The small sine bob rides on TOP of that
+  // offset, not through zero, so it never dips back down to dashboard
+  // height.
+  _patrolTarget(f, gameDt, flight) {
+    f.orbitAngle += CONFIG.FIGHTER_ORBIT_SWEEP_SPEED * gameDt;
+    const bearingRad = Math.sin(f.orbitAngle) * THREE.MathUtils.degToRad(CONFIG.FIGHTER_VISIBLE_ARC_DEG);
+    const bearingDir = this._safeFlatForward(flight).applyAxisAngle(UP, bearingRad);
+    const vertical = f.altitudeOffset + Math.sin(f.orbitAngle * 0.6) * 25;
+    return flight.position.clone().addScaledVector(bearingDir, f.orbitRadius).add(new THREE.Vector3(0, vertical, 0));
+  }
+
+  _cooldownTarget(f, flight) {
+    const away = f.mesh.position.clone().sub(flight.position).setY(0);
+    if (away.lengthSq() < 1) away.set(1, 0, 0);
+    away.normalize();
+    return flight.position.clone().addScaledVector(away, CONFIG.FIGHTER_ORBIT_MAX).setY(f.mesh.position.y);
+  }
+
+  _beginAttack(f) {
+    f.state = 'attack';
+    f.attackPhase = 'closing';
+    f.attackSide = Math.random() < 0.5 ? 1 : -1;
+    f.attackAngle = randRange(CONFIG.ATTACK_REAR_ANGLE_MIN, CONFIG.ATTACK_REAR_ANGLE_MAX);
+    f.attackDist = randRange(CONFIG.ATTACK_REAR_DIST_MIN, CONFIG.ATTACK_REAR_DIST_MAX);
+    f.closingTimer = 0;
+    console.log('[threats] fighter swings to attack');
+  }
+
+  // Rear-quarter slot: behind the player, off dead-astern by attackAngle
+  // toward attackSide — "a quarter," not a dead-six attack straight down
+  // the player's tail.
+  _attackTargetPos(f, flight) {
+    const flatForward = this._safeFlatForward(flight);
+    const backDir = flatForward.clone().negate().applyAxisAngle(UP, f.attackSide * THREE.MathUtils.degToRad(f.attackAngle));
+    return flight.position.clone().addScaledVector(backDir, f.attackDist);
+  }
+
+  _abortAttack(f) {
+    f.state = 'cooldown';
+    f.attackPhase = null;
+    f.radarLineup = false;
+    f.cooldownTimer = randRange(CONFIG.COOLDOWN_MIN, CONFIG.COOLDOWN_MAX);
+    console.log('[threats] fighter aborts attack (never reached slot)');
+  }
+
+  _updateAttack(f, dt, gameDt, flight, fear, flatRight) {
+    const targetPos = this._attackTargetPos(f, flight);
+
+    if (f.attackPhase === 'closing') {
+      f.closingTimer += dt;
+      if (f.mesh.position.distanceTo(targetPos) < CONFIG.ATTACK_SLOT_RADIUS) {
+        f.attackPhase = 'lineup';
+        f.lineupTimer = CONFIG.ATTACK_LINEUP_DURATION;
+        f.radarLineup = true;
+        this.audio.playFighterLineupCue(this._panFor(f.mesh.position, flight, flatRight));
+        console.log('[threats] fighter lining up');
+      } else if (f.closingTimer > CONFIG.ATTACK_CLOSING_TIMEOUT) {
+        this._abortAttack(f);
+      }
+      return targetPos;
+    }
+
+    if (f.attackPhase === 'lineup') {
+      f.lineupTimer -= dt;
+      if (f.lineupTimer <= 0) {
+        f.attackPhase = 'burst';
+        f.attackHit = Math.random() < this._fighterAccuracy;
+        f.burstTimer = CONFIG.ATTACK_BURST_DURATION;
+        f.burstResolved = false;
+        f.tracerSpawnTimer = 0;
+        f.radarLineup = false;
+        f.burstJustStarted = true;
+        console.log('[threats] fighter opens fire');
+      }
+      return targetPos;
+    }
+
+    // burst
+    f.burstTimer -= dt;
+    f.tracerSpawnTimer -= gameDt;
+    if (f.tracerSpawnTimer <= 0) {
+      f.tracerSpawnTimer = CONFIG.ATTACK_TRACER_SPAWN_INTERVAL;
+      this._spawnTracer(f, flight);
+    }
+    if (!f.burstResolved && f.burstTimer <= CONFIG.ATTACK_BURST_DURATION - CONFIG.ATTACK_TRACER_TRAVEL_TIME) {
+      this._resolveAttackBurst(f, flight, fear);
+      f.burstResolved = true;
+    }
+    if (f.burstTimer <= 0) {
+      f.state = 'cooldown';
+      f.attackPhase = null;
+      f.cooldownTimer = randRange(CONFIG.COOLDOWN_MIN, CONFIG.COOLDOWN_MAX);
+      console.log('[threats] fighter breaks away');
+    }
+    return targetPos;
+  }
+
+  // Hit/miss is decided at line-up's end (f.attackHit) so every tracer this
+  // burst aims consistently; the fear/tumble/shake consequence lands here,
+  // ATTACK_TRACER_TRAVEL_TIME into the burst — not instantly on trigger,
+  // matching the tracers' actual travel time.
+  _resolveAttackBurst(f, flight, fear) {
+    if (f.attackHit) {
       fear.addInstant('fighter-gun-hit', CONFIG.FEAR_GUN_HIT_INSTANT);
       flight.triggerTumble(CONFIG.GUN_HIT_TUMBLE_DURATION);
       flight.triggerImpactShake(CONFIG.GUN_HIT_IMPACT_SHAKE_DURATION, CONFIG.GUN_HIT_IMPACT_SHAKE_MAG);
@@ -964,6 +1447,189 @@ export class Threats {
       fear.addInstant('fighter-gun-near-miss', CONFIG.FEAR_GUN_NEAR_MISS_INSTANT);
       console.log('[threats] fighter gun burst (near miss)');
     }
+  }
+
+  _spawnTracer(f, flight) {
+    const slot = this._tracers.find((t) => !t.active) || this._tracers[0];
+    const start = f.mesh.position;
+    const spread = f.attackHit ? CONFIG.ATTACK_TRACER_HIT_SPREAD : CONFIG.ATTACK_TRACER_MISS_SPREAD;
+    const jitter = new THREE.Vector3((Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2);
+    const aim = flight.position.clone().addScaledVector(jitter, spread);
+
+    const dir = aim.clone().sub(start);
+    const dist = dir.length();
+    if (dist < 1) return;
+    dir.normalize();
+
+    slot.active = true;
+    slot.dir.copy(dir);
+    slot.speed = CONFIG.ATTACK_TRACER_SPEED;
+    slot.traveled = 0;
+    slot.maxDist = dist + 150; // flies a bit past the aim point rather than vanishing right at it
+    slot.mesh.position.copy(start);
+    slot.mesh.quaternion.setFromUnitVectors(FORWARD, dir);
+    slot.mesh.visible = true;
+  }
+
+  _updateTracers(gameDt) {
+    for (const t of this._tracers) {
+      if (!t.active) continue;
+      const step = t.speed * gameDt;
+      t.traveled += step;
+      t.mesh.position.addScaledVector(t.dir, step);
+      if (t.traveled >= t.maxDist) {
+        t.active = false;
+        t.mesh.visible = false;
+      }
+    }
+  }
+
+  // Flies like an aircraft, not a camera: f.heading turns toward the target
+  // direction at a bounded rate, then position advances along THAT SAME
+  // heading — so the rendered nose (FORWARD rotated by f.mesh.quaternion)
+  // and the real frame-to-frame velocity are identical by construction,
+  // not two independently-derived quantities that can drift apart. Speed
+  // is always a multiple of the player's CURRENT speed (speedMult, e.g.
+  // FIGHTER_PATROL_SPEED_MULT_MIN/MAX), so a fighter chasing a target that
+  // itself moves at player speed can actually close the gap instead of
+  // settling into a permanent lag — and if it ever ends up more than
+  // FIGHTER_CATCHUP_DIST from the player regardless (a wave transition
+  // teleport, a stall recovery, anything), FIGHTER_CATCHUP_SPEED_MULT
+  // overrides speedMult until it's back in range. Banking is a pure roll
+  // about the heading axis (rollQuat rotates AROUND f.heading itself), so
+  // by the same construction it can never rotate the nose off of heading —
+  // verified: q*FORWARD = baseQuat*(rollQuat*FORWARD) = baseQuat*FORWARD =
+  // heading, for any roll angle.
+  _steerFighter(f, targetPos, flight, gameDt, speedMult) {
+    const toTarget = targetPos.clone().sub(f.mesh.position);
+    const distToTarget = toTarget.length();
+    const desired = toTarget.lengthSq() > 1e-6 ? toTarget.normalize() : f.heading.clone();
+
+    // Self-correcting fallback: a zero-length f.heading can otherwise never
+    // recover on its own — crossVectors against a zero vector is always
+    // zero, so the turn step below would silently no-op forever and the
+    // fighter would freeze in world space permanently (this is exactly how
+    // a fighter whose heading got initialized from a not-yet-valid
+    // flight.forward — see _safeFlatForward — used to get stuck for its
+    // whole lifetime). Snap straight to the desired direction this one
+    // time; there's no meaningful "previous heading" to turn from anyway.
+    if (f.heading.lengthSq() < 1e-6) {
+      f.heading.copy(desired.lengthSq() > 1e-6 ? desired : FORWARD);
+    }
+
+    const maxTurn = THREE.MathUtils.degToRad(CONFIG.FIGHTER_TURN_RATE_DEG) * gameDt;
+    const angle = f.heading.angleTo(desired);
+    let signedTurn = 0;
+    if (angle > 1e-4) {
+      const axis = new THREE.Vector3().crossVectors(f.heading, desired);
+      if (axis.lengthSq() > 1e-8) {
+        axis.normalize();
+        const turn = Math.min(angle, maxTurn);
+        f.heading.applyAxisAngle(axis, turn).normalize();
+        signedTurn = axis.y < 0 ? -turn : turn;
+      }
+    }
+
+    // Speed: the caller's speedMult is a "holding formation" number
+    // (PATROL's 1.05-1.15x) — fine once actually close to the target, but
+    // nowhere near enough closing power against a target that itself
+    // inherits the player's translation (see FIGHTER_CLOSING_DIST's
+    // comment): a pursuer with only a 5-15% speed edge and a bounded turn
+    // rate settles into a stable, LOOSE orbit around a laterally-drifting
+    // target instead of ever arriving. FIGHTER_BRISK_SPEED_MULT kicks in
+    // whenever still far from THIS FRAME's target, regardless of state;
+    // FIGHTER_CATCHUP_SPEED_MULT is the separate, harder override for the
+    // "somehow ended up far from the PLAYER entirely" safety net.
+    const distToPlayer = f.mesh.position.distanceTo(flight.position);
+    const closingMult =
+      distToTarget > CONFIG.FIGHTER_CLOSING_DIST ? Math.max(speedMult, CONFIG.FIGHTER_BRISK_SPEED_MULT) : speedMult;
+    const speed =
+      distToPlayer > CONFIG.FIGHTER_CATCHUP_DIST
+        ? flight.speed * CONFIG.FIGHTER_CATCHUP_SPEED_MULT
+        : flight.speed * closingMult;
+    f.mesh.position.addScaledVector(f.heading, speed * gameDt);
+
+    const yawRate = gameDt > 0 ? signedTurn / gameDt : 0;
+    const maxBank = THREE.MathUtils.degToRad(CONFIG.FIGHTER_MAX_BANK_DEG);
+    const targetBank = THREE.MathUtils.clamp(-yawRate * CONFIG.FIGHTER_BANK_GAIN, -maxBank, maxBank);
+    f.bank = smoothDamp(f.bank, targetBank, f.bankVel, CONFIG.FIGHTER_BANK_SMOOTH_TIME, gameDt);
+
+    const baseQuat = new THREE.Quaternion().setFromUnitVectors(FORWARD, f.heading);
+    const rollQuat = new THREE.Quaternion().setFromAxisAngle(FORWARD, f.bank);
+    f.mesh.quaternion.copy(baseQuat).multiply(rollQuat);
+  }
+
+  // Contrail ribbon: same pooled-puff technique as a missile's exhaust trail
+  // (_updateTrail) but twice as long and plain white — a readability layer
+  // that's independent of whatever the real model looks like up close.
+  _updateFighterTrail(f, gameDt) {
+    f.trailTimer -= gameDt;
+    if (f.trailTimer <= 0) {
+      f.trailTimer = CONFIG.FIGHTER_TRAIL_SAMPLE_INTERVAL;
+      f.trailHistory.unshift(f.mesh.position.clone());
+      if (f.trailHistory.length > CONFIG.FIGHTER_TRAIL_LENGTH) f.trailHistory.length = CONFIG.FIGHTER_TRAIL_LENGTH;
+    }
+    for (let i = 0; i < f.trail.length; i++) {
+      const sprite = f.trail[i];
+      const histPos = f.trailHistory[i];
+      if (!histPos) {
+        sprite.visible = false;
+        continue;
+      }
+      const t = i / CONFIG.FIGHTER_TRAIL_LENGTH;
+      sprite.visible = true;
+      sprite.position.copy(histPos);
+      sprite.material.opacity = (1 - t) * 0.7;
+      sprite.scale.setScalar(THREE.MathUtils.lerp(4, 10, t));
+    }
+  }
+
+  _spawnFighter(f, flight) {
+    f.active = true;
+    f.mesh.visible = true;
+    f.state = 'patrol';
+    f.attackPhase = null;
+    f.radarLineup = false;
+    f.lifeTimer = randRange(CONFIG.FIGHTER_LIFETIME_MIN, CONFIG.FIGHTER_LIFETIME_MAX);
+    f.orbitAngle = Math.random() * Math.PI * 2;
+    f.orbitRadius = randRange(CONFIG.FIGHTER_ORBIT_MIN, CONFIG.FIGHTER_ORBIT_MAX);
+    f.patrolSpeedMult = randRange(CONFIG.FIGHTER_PATROL_SPEED_MULT_MIN, CONFIG.FIGHTER_PATROL_SPEED_MULT_MAX);
+    f.altitudeOffset = randRange(CONFIG.FIGHTER_ALTITUDE_OFFSET_MIN, CONFIG.FIGHTER_ALTITUDE_OFFSET_MAX);
+    f.attackTimer = randRange(this._fighterAttackMin, this._fighterAttackMax);
+
+    // Spawns already inside the visible arc AND above the player, so it
+    // reads as "appearing ahead of you, against the sky," never popping in
+    // on your six or below the dashboard line. Uses _safeFlatForward, not a
+    // raw flight.forward.clone().setY(0).normalize() — flight.forward can
+    // be a zero vector this early (see _safeFlatForward's comment), and a
+    // zero spawn bearing means the fighter spawns AT the player (dist 0)
+    // with a zero f.heading that _steerFighter could never turn away from
+    // on its own.
+    const flatForward = this._safeFlatForward(flight);
+    const bearingRad = (Math.random() * 2 - 1) * THREE.MathUtils.degToRad(CONFIG.FIGHTER_VISIBLE_ARC_DEG);
+    const bearingDir = flatForward.clone().applyAxisAngle(UP, bearingRad);
+    f.mesh.position
+      .copy(flight.position)
+      .addScaledVector(bearingDir, f.orbitRadius)
+      .add(new THREE.Vector3(0, f.altitudeOffset, 0));
+    f.heading.copy(flatForward);
+    f._diagPrevPos.copy(f.mesh.position);
+    f.bank = 0;
+    f.bankVel.value = 0;
+    console.log('[threats] fighter appears');
+  }
+
+  _despawnFighter(f) {
+    f.active = false;
+    f.mesh.visible = false;
+    f.state = 'patrol';
+    f.attackPhase = null;
+    f.radarLineup = false;
+    f.spawnTimer = randRange(CONFIG.FIGHTER_SPAWN_MIN, CONFIG.FIGHTER_SPAWN_MAX);
+    for (const s of f.trail) s.visible = false;
+    f.trailHistory.length = 0;
+    f.trailTimer = 0;
+    console.log('[threats] fighter leaves');
   }
 
   // Signed bearing (radians, 0=ahead, +/- toward either side) of every active
@@ -1050,7 +1716,17 @@ export class Threats {
       if (!f.active) continue;
       const p = project(f.mesh.position);
       if (p.dist < 1 || p.dist > range) continue;
-      results.push({ type: 'fighter', localRight: p.right, localForward: p.forward, warning: false, dirRight: null, dirForward: null, trail: [], dodgeWindow: false });
+      results.push({
+        type: 'fighter',
+        localRight: p.right,
+        localForward: p.forward,
+        warning: false,
+        dirRight: null,
+        dirForward: null,
+        trail: [],
+        dodgeWindow: false,
+        lineup: f.radarLineup, // ui.js draws the dot orange while true
+      });
     }
 
     for (const e of this._radarEchoes) {
@@ -1085,7 +1761,8 @@ export class Threats {
   }
 
   // "Genuinely calm air": true while any missile is locking-on or homing, or
-  // any fighter is currently in front — main.js reads this once per frame
+  // any fighter is currently threatening (in front, or mid-attack — see
+  // f.threatening in _updateFighters) — main.js reads this once per frame
   // (before fear.update()) and it's what gates fear.js's calm-decay-toward-
   // floor and safety valve. Broader than "currently adding continuous fear
   // right now" on purpose: a homing missile still 2000 units out isn't yet
@@ -1095,8 +1772,52 @@ export class Threats {
       if (m.active && (m.state === 'lockon' || m.state === 'homing')) return true;
     }
     for (const f of this._fighters) {
-      if (f.active && f.inFront) return true;
+      if (f.active && f.threatening) return true;
     }
     return false;
+  }
+
+  // T-key debug overlay (ui.js's _drawFighterDebugOverlay): per active
+  // fighter, state/phase, straight-line distance, and bearing off the
+  // player's nose — the numbers needed to tell "orbiting me" from
+  // "wandering off" at a glance. Also reports noseDivergenceDeg, the angle
+  // between the fighter's rendered nose and its ACTUAL frame-to-frame
+  // displacement — this is a live sanity check on _steerFighter's core
+  // invariant (nose == velocity by construction) and should read ~0 always;
+  // a nonzero value here would mean something is moving f.mesh.position
+  // without going through _steerFighter.
+  getFighterDebugInfo(flight) {
+    const flatForward = flight.forward.clone().setY(0).normalize();
+    return this._fighters
+      .filter((f) => f.active)
+      .map((f) => {
+        const toFighter = f.mesh.position.clone().sub(flight.position);
+        const dist = toFighter.length();
+        toFighter.setY(0);
+        let angleDeg = 0;
+        if (toFighter.lengthSq() > 1e-6) {
+          toFighter.normalize();
+          const dot = THREE.MathUtils.clamp(flatForward.dot(toFighter), -1, 1);
+          let angle = Math.acos(dot);
+          const cross = new THREE.Vector3().crossVectors(flatForward, toFighter);
+          if (cross.y < 0) angle = -angle;
+          angleDeg = THREE.MathUtils.radToDeg(angle);
+        }
+
+        const realVel = f.mesh.position.clone().sub(f._diagPrevPos);
+        let noseDivergenceDeg = 0;
+        if (realVel.lengthSq() > 1e-8) {
+          noseDivergenceDeg = THREE.MathUtils.radToDeg(realVel.normalize().angleTo(f.heading));
+        }
+        f._diagPrevPos.copy(f.mesh.position);
+
+        return {
+          state: f.state,
+          phase: f.attackPhase,
+          dist: Math.round(dist),
+          angleDeg: Math.round(angleDeg),
+          noseDivergenceDeg: Math.round(noseDivergenceDeg * 10) / 10,
+        };
+      });
   }
 }

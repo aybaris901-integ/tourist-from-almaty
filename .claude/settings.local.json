@@ -3,7 +3,14 @@
     "allow": [
       "PowerShell(npm *)",
       "Bash(npx vite *)",
-      "Bash(node -e \"const d=require\\('./src/radio_lines.json'\\); console.log\\('entries:', d.length\\); const bad = d.filter\\(l => !l.speaker\\); console.log\\('missing speaker:', bad.map\\(l=>l.id\\)\\);\")"
+      "Bash(node -e \"const d=require\\('./src/radio_lines.json'\\); console.log\\('entries:', d.length\\); const bad = d.filter\\(l => !l.speaker\\); console.log\\('missing speaker:', bad.map\\(l=>l.id\\)\\);\")",
+      "Bash(node *)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(npm run *)",
+      "Bash(netstat -ano)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:5183/)",
+      "Bash(curl -s http://localhost:5183/)",
+      "Bash(git status *)"
     ]
   }
 }

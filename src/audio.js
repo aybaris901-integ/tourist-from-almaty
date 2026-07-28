@@ -1,4 +1,5 @@
 import { CONFIG as FEAR_CONFIG } from './fear.js';
+import { MusicManager } from './musicManager.js';
 
 const LOCK_BEEP_INTERVAL_START = 0.45; // seconds between RWR beeps at lock-on progress=0
 const LOCK_BEEP_INTERVAL_END = 0.12; // ...at progress=1 (about to launch)
@@ -14,84 +15,15 @@ const APPROACH_GAIN_FAR = 0.15;
 const APPROACH_GAIN_NEAR = 0.45;
 
 // --- Music -------------------------------------------------------------
-// One synthesized, looping motif per country — no asset downloads, same
-// "procedural over asset" rule as the 3D art (see CLAUDE.md). Crossfades
-// MUSIC_CROSSFADE seconds on setMusicCountry() (route.js, on every wave
-// change); ducks by MUSIC_DUCK_GAIN while a radio call is active
-// (setMusicDucked(), called from radio.js's _startCall/_endCall); gets
-// muffled (lowpassed) as fear climbs past the VIGNETTE(60) threshold — see
-// update()'s `_musicFilter` handling. This is "the world" going muffled,
-// deliberately NOT applied to the lock-tone/approach-ping/heartbeat, which
-// need to stay piercing as warnings regardless of how scared you are.
-const MUSIC_CROSSFADE = 3;
-const MUSIC_LOOKAHEAD = 0.6; // seconds of notes scheduled ahead, per update()
+// Real per-country tracks (musicManager.js), fed into a shared fear-reactive
+// chain: MusicManager -> _musicBus (mix point) -> _musicFilter ("muffle the
+// world" lowpass, see update()) -> _musicDuckGain (-6dB while a radio call
+// is active, see setMusicDucked()) -> destination. Deliberately NOT applied
+// to the lock-tone/approach-ping/heartbeat, which need to stay piercing as
+// warnings regardless of how scared you are.
 const MUSIC_DUCK_GAIN = Math.pow(10, -6 / 20); // -6dB while radio.active
 const MUSIC_MUFFLE_MIN_CUTOFF = 500; // lowpass Hz at fear=100
 const MUSIC_MUFFLE_MAX_CUTOFF = 18000; // effectively unfiltered
-
-// Each voice: rootFreq (Hz) + bpm define the grid; `pattern` is
-// [semitoneOffsetFromRoot|null, beats][] (null = rest); `style` picks the
-// envelope shape ('pluck' = fast attack/decay for dombra/saz, 'sustain' =
-// held for duduk/mugham legato); `gain` is the per-note peak; `lowpass`/
-// `vibrato`/`detuneCents` are optional per-instrument color.
-const COUNTRY_MUSIC = {
-  // Dombra-ish: plucky pentatonic minor, syncopated.
-  kazakhstan: {
-    voices: [
-      {
-        rootFreq: 110, bpm: 100, waveform: 'triangle', style: 'pluck', gain: 0.16,
-        pattern: [[0, 1], [7, 0.5], [5, 0.5], [3, 1], [0, 1], [10, 0.5], [7, 0.5], [5, 1]],
-      },
-    ],
-  },
-  // Mugham-ish: Phrygian dominant scale (1 b2 3 4 5 b6 b7), slow ornamented sustain.
-  azerbaijan: {
-    voices: [
-      {
-        rootFreq: 147, bpm: 66, waveform: 'sawtooth', style: 'sustain', gain: 0.14, lowpass: 1200,
-        vibrato: { rate: 4.5, cents: 12 },
-        pattern: [[0, 2], [1, 1], [4, 1], [3, 2], [7, 2], [8, 1], [6, 1], [0, 2]],
-      },
-    ],
-  },
-  // Duduk-ish: natural minor, long legato reedy lead.
-  georgia: {
-    voices: [
-      {
-        rootFreq: 165, bpm: 58, waveform: 'sawtooth', style: 'sustain', gain: 0.15, lowpass: 800,
-        vibrato: { rate: 5, cents: 8 },
-        pattern: [[0, 3], [3, 2], [5, 3], [3, 2], [-2, 3], [0, 2], [-5, 4]],
-      },
-    ],
-  },
-  // Saz-ish: Hicaz-flavored (1 b2 3 4 5 b6 7), fast plucky arpeggios.
-  turkey: {
-    voices: [
-      {
-        rootFreq: 196, bpm: 128, waveform: 'sawtooth', style: 'pluck', gain: 0.13, detuneCents: 6,
-        pattern: [[0, 0.5], [1, 0.5], [4, 0.5], [5, 0.5], [7, 0.5], [5, 0.5], [4, 0.5], [1, 0.5]],
-      },
-    ],
-  },
-  // Istanbul: the journey converges — soft layers of all three flavors together.
-  istanbul: {
-    voices: [
-      {
-        rootFreq: 110, bpm: 100, waveform: 'triangle', style: 'pluck', gain: 0.08,
-        pattern: [[0, 1], [7, 0.5], [5, 0.5], [3, 1], [0, 1], [10, 0.5], [7, 0.5], [5, 1]],
-      },
-      {
-        rootFreq: 165, bpm: 58, waveform: 'sawtooth', style: 'sustain', gain: 0.1, lowpass: 900,
-        vibrato: { rate: 5, cents: 8 },
-        pattern: [[0, 3], [3, 2], [5, 3], [3, 2], [-2, 3], [0, 2], [-5, 4]],
-      },
-      {
-        rootFreq: 196, bpm: 128, waveform: 'sawtooth', style: 'pluck', gain: 0.09, detuneCents: 6,
-        pattern: [[0, 0.5], [1, 0.5], [4, 0.5], [5, 0.5], [7, 0.5], [5, 0.5], [4, 0.5], [1, 0.5]],
-      },
-    ],
-  },
-};
 
 // Radio voice: Animal-Crossing-style gibberish, a distinct pitch profile per
 // character (radio_lines.json's `speaker` field) so Bagdat and the NATO
@@ -101,9 +33,9 @@ const VOICE_PROFILES = {
   nato_pilot: { baseFreq: 255, freqJitter: 45, formant: 1500 },
 };
 
-// Procedural placeholder audio, no asset downloads: breathing/heartbeat tied
-// to the fear meter, plus threat/radio one-shots (RWR lock tone, whoosh,
-// impact thud, radio blip). Everything is synthesized with the Web Audio API.
+// Breathing/heartbeat tied to the fear meter, threat/radio one-shots (RWR
+// lock tone, whoosh, impact thud, radio blip) synthesized with the Web
+// Audio API, plus real per-country music playback (musicManager.js).
 export class FearAudio {
   constructor() {
     this.ctx = null;
@@ -120,10 +52,21 @@ export class FearAudio {
     this._approachPan = 0;
     this._approachTimer = 0;
 
-    // Music (see COUNTRY_MUSIC / setMusicCountry / _updateMusic).
-    this._musicTracks = []; // { voices: [{...def, nextTime, nextIndex}], gain: GainNode, stopAt: number|null }
-    this._musicCountry = null;
-    this._pendingMusicCountry = null; // setMusicCountry() called before resume() — applied once the context exists
+    // Fighter engine drone (see _buildFighterEngine) — a persistent node,
+    // not a repeated one-shot like the approach ping, since it needs to
+    // hold a continuous tone while a fighter is nearby in any state.
+    this._engineActive = false;
+
+    // Music (see musicManager.js / setMusicCountry / preloadMusicCountry).
+    // AudioContext (and therefore MusicManager, which needs it to decode
+    // audio) doesn't exist until resume() — setMusicCountry()/
+    // preloadMusicCountry() called before that just queue up here and are
+    // replayed once resume() actually builds everything. This mirrors the
+    // browser's autoplay policy: nothing loads or plays before the player's
+    // first click/keypress triggers resume().
+    this._music = null;
+    this._pendingMusicCountry = null;
+    this._pendingPreloadKey = null;
   }
 
   // AudioContext must be created/resumed from a user gesture; call this from
@@ -136,11 +79,17 @@ export class FearAudio {
       this._buildNoiseBuffer();
       this._buildBreathing();
       this._buildHeartbeatBus();
+      this._buildFighterEngine();
       this._buildMusicBus();
       if (this._pendingMusicCountry) {
         const key = this._pendingMusicCountry;
         this._pendingMusicCountry = null;
         this.setMusicCountry(key);
+      }
+      if (this._pendingPreloadKey) {
+        const key = this._pendingPreloadKey;
+        this._pendingPreloadKey = null;
+        this.preloadMusicCountry(key);
       }
     }
     if (this.ctx.state === 'suspended') this.ctx.resume();
@@ -179,9 +128,39 @@ export class FearAudio {
     this._heartbeatBus.connect(this.ctx.destination);
   }
 
-  // Music signal chain: per-country tracks -> _musicBus (mix point) ->
-  // _musicFilter (the "muffle the world" lowpass, see update()) ->
-  // _musicDuckGain (the -6dB radio duck, see setMusicDucked) -> destination.
+  // Persistent low drone for a nearby fighter (threats.js's _updateFighters
+  // picks the nearest active one each frame) — a continuous node rather
+  // than a repeated beep, since "engine noise" has to sit there humming, not
+  // pulse like a warning. Gain starts at 0 and idles silently until a
+  // fighter is actually in range (see startFighterEngine/updateFighterEngine).
+  _buildFighterEngine() {
+    const ctx = this.ctx;
+    const osc = ctx.createOscillator();
+    osc.type = 'sawtooth';
+    osc.frequency.value = 80;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 400;
+
+    this._engineGain = ctx.createGain();
+    this._engineGain.gain.value = 0;
+
+    this._enginePanner = ctx.createStereoPanner();
+
+    osc.connect(filter);
+    filter.connect(this._engineGain);
+    this._engineGain.connect(this._enginePanner);
+    this._enginePanner.connect(ctx.destination);
+    osc.start();
+    this._engineOsc = osc;
+  }
+
+  // Fear-reactive chain that MusicManager's real playback feeds into:
+  // MusicManager -> _musicBus (mix point) -> _musicFilter ("muffle the
+  // world" lowpass, see update()) -> _musicDuckGain (-6dB radio duck, see
+  // setMusicDucked) -> destination. This chain is unchanged from the old
+  // synthesized version — only what feeds _musicBus changed.
   _buildMusicBus() {
     const ctx = this.ctx;
     this._musicBus = ctx.createGain();
@@ -197,39 +176,34 @@ export class FearAudio {
     this._musicBus.connect(this._musicFilter);
     this._musicFilter.connect(this._musicDuckGain);
     this._musicDuckGain.connect(ctx.destination);
+
+    this._music = new MusicManager(ctx, this._musicBus);
   }
 
   // Country transition (route.js's _applyWave, on every wave change):
-  // crossfades MUSIC_CROSSFADE seconds from whatever's currently playing
-  // into `key`'s loop. Safe to call before the AudioContext exists (the
-  // very first wave applies before the player's first click) — remembered
-  // in _pendingMusicCountry and applied once resume() actually builds it.
+  // crossfades into `key`'s real track (musicManager.js). Safe to call
+  // before the AudioContext exists (the very first wave applies before the
+  // player's first click) — remembered in _pendingMusicCountry and applied
+  // once resume() actually builds everything, same deferral the browser's
+  // autoplay policy already requires of us.
   setMusicCountry(key) {
     if (!this._started) {
       this._pendingMusicCountry = key;
       return;
     }
-    if (this._musicCountry === key) return;
-    this._musicCountry = key;
-    const now = this.ctx.currentTime;
+    this._music.setCountry(key);
+  }
 
-    for (const entry of this._musicTracks) {
-      if (entry.stopAt !== null) continue; // already fading out from an earlier transition
-      entry.gain.gain.cancelScheduledValues(now);
-      entry.gain.gain.setValueAtTime(entry.gain.gain.value, now);
-      entry.gain.gain.linearRampToValueAtTime(0, now + MUSIC_CROSSFADE);
-      entry.stopAt = now + MUSIC_CROSSFADE + 0.2;
+  // route.js calls this with the NEXT wave's key as soon as the current one
+  // starts, so the track is already decoded by the time the player gets
+  // there — no gap on the actual transition. Same pre-start deferral as
+  // setMusicCountry() if called before the player's first click.
+  preloadMusicCountry(key) {
+    if (!this._started) {
+      this._pendingPreloadKey = key;
+      return;
     }
-
-    const def = COUNTRY_MUSIC[key];
-    if (!def) return;
-    const gain = this.ctx.createGain();
-    gain.gain.setValueAtTime(0, now);
-    gain.gain.linearRampToValueAtTime(1, now + MUSIC_CROSSFADE);
-    gain.connect(this._musicBus);
-
-    const voices = def.voices.map((v) => ({ ...v, nextTime: now + 0.05, nextIndex: 0 }));
-    this._musicTracks.push({ voices, gain, stopAt: null });
+    this._music.preload(key);
   }
 
   // radio.js calls this from _startCall/_endCall — smoothly ducks/restores
@@ -238,75 +212,6 @@ export class FearAudio {
     if (!this._started) return;
     const now = this.ctx.currentTime;
     this._musicDuckGain.gain.setTargetAtTime(active ? MUSIC_DUCK_GAIN : 1, now, 0.15);
-  }
-
-  // Lookahead scheduler: each update() schedules any notes due within the
-  // next MUSIC_LOOKAHEAD seconds, per voice, per active track (there are two
-  // tracks briefly during a crossfade). Tracks whose fade-out has finished
-  // are dropped here rather than via a timer, so cleanup stays on the same
-  // clock as scheduling.
-  _updateMusic(now) {
-    for (const entry of this._musicTracks) {
-      for (const v of entry.voices) {
-        while (v.nextTime < now + MUSIC_LOOKAHEAD) {
-          const [semis, beats] = v.pattern[v.nextIndex % v.pattern.length];
-          const dur = beats * (60 / v.bpm);
-          if (semis !== null) this._playMusicNote(entry.gain, v, semis, v.nextTime, dur);
-          v.nextTime += dur;
-          v.nextIndex += 1;
-        }
-      }
-    }
-    this._musicTracks = this._musicTracks.filter((entry) => !(entry.stopAt !== null && now >= entry.stopAt));
-  }
-
-  _playMusicNote(destination, v, semis, time, dur) {
-    const ctx = this.ctx;
-    const freq = v.rootFreq * Math.pow(2, semis / 12);
-
-    const osc = ctx.createOscillator();
-    osc.type = v.waveform;
-    osc.frequency.value = freq;
-    if (v.detuneCents) osc.detune.value = v.detuneCents;
-
-    let node = osc;
-    if (v.lowpass) {
-      const filter = ctx.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.value = v.lowpass;
-      osc.connect(filter);
-      node = filter;
-    }
-
-    const env = ctx.createGain();
-    env.gain.setValueAtTime(0, time);
-    if (v.style === 'pluck') {
-      env.gain.linearRampToValueAtTime(v.gain, time + 0.008);
-      env.gain.exponentialRampToValueAtTime(0.0001, time + Math.min(dur * 0.95, 0.6));
-    } else {
-      // 'sustain': legato hold through most of the note, then release.
-      env.gain.linearRampToValueAtTime(v.gain, time + Math.min(dur * 0.25, 0.2));
-      env.gain.setValueAtTime(v.gain, time + Math.max(dur - 0.15, dur * 0.5));
-      env.gain.exponentialRampToValueAtTime(0.0001, time + dur);
-    }
-
-    node.connect(env);
-    env.connect(destination);
-    osc.start(time);
-    osc.stop(time + dur + 0.05);
-
-    if (v.vibrato) {
-      // Audio-rate signals connected to an AudioParam ADD to its intrinsic
-      // value, so this composes fine with detuneCents above.
-      const lfo = ctx.createOscillator();
-      lfo.frequency.value = v.vibrato.rate;
-      const lfoGain = ctx.createGain();
-      lfoGain.gain.value = v.vibrato.cents;
-      lfo.connect(lfoGain);
-      lfoGain.connect(osc.detune);
-      lfo.start(time);
-      lfo.stop(time + dur + 0.05);
-    }
   }
 
   _playThump(bus, startFreq, endFreq, duration) {
@@ -392,6 +297,99 @@ export class FearAudio {
 
   stopApproachPing() {
     this._approachActive = false;
+  }
+
+  // Fighter engine drone, panned/pitched by the nearest active fighter's
+  // bearing/proximity (threats.js's _updateFighters calls this every frame
+  // one exists, same idempotent-start pattern as startApproachPing above).
+  startFighterEngine() {
+    this._engineActive = true;
+  }
+
+  updateFighterEngine(pan, proximity) {
+    if (!this._started || !this._engineActive) return;
+    const now = this.ctx.currentTime;
+    const clampedProximity = Math.max(0, Math.min(1, proximity));
+    const gain = 0.06 + 0.22 * clampedProximity;
+    const freq = 80 + 70 * clampedProximity;
+    this._engineGain.gain.setTargetAtTime(gain, now, 0.15);
+    this._engineOsc.frequency.setTargetAtTime(freq, now, 0.2);
+    this._enginePanner.pan.setTargetAtTime(Math.max(-1, Math.min(1, pan)), now, 0.1);
+  }
+
+  stopFighterEngine() {
+    this._engineActive = false;
+    if (!this._started) return;
+    this._engineGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.2);
+  }
+
+  // ATTACK line-up warning: a rapid rattle of ascending clicks — deliberately
+  // NOT a single sweep like playDodgeCue below, so the two telegraphs (missile
+  // dodge window vs. a fighter lining up on your six) don't get confused for
+  // each other by ear.
+  playFighterLineupCue(pan = 0) {
+    if (!this._started) return;
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+    const clicks = 6;
+
+    for (let i = 0; i < clicks; i++) {
+      const t = now + i * 0.055;
+      const osc = ctx.createOscillator();
+      osc.type = 'square';
+      osc.frequency.value = 260 + i * 12;
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0, t);
+      env.gain.linearRampToValueAtTime(0.22, t + 0.006);
+      env.gain.exponentialRampToValueAtTime(0.001, t + 0.045);
+
+      const panner = ctx.createStereoPanner();
+      panner.pan.value = Math.max(-1, Math.min(1, pan));
+
+      osc.connect(env);
+      env.connect(panner);
+      panner.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.05);
+    }
+  }
+
+  // Gun burst: filtered-noise rounds, same bandpass-noise building block as
+  // playRadioBlip but tighter/faster so it reads as automatic fire, not
+  // static. One call per ATTACK burst (threats.js fires it once, at the
+  // moment the burst phase begins).
+  playGunBurst(pan = 0) {
+    if (!this._started) return;
+    const ctx = this.ctx;
+    const start = ctx.currentTime;
+    const rounds = 8;
+
+    for (let i = 0; i < rounds; i++) {
+      const t = start + i * 0.05 + Math.random() * 0.01;
+      const source = ctx.createBufferSource();
+      source.buffer = this._noiseBuffer;
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'bandpass';
+      filter.frequency.value = 1400 + Math.random() * 300;
+      filter.Q.value = 2.5;
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0, t);
+      env.gain.linearRampToValueAtTime(0.3, t + 0.005);
+      env.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+
+      const panner = ctx.createStereoPanner();
+      panner.pan.value = Math.max(-1, Math.min(1, pan));
+
+      source.connect(filter);
+      filter.connect(env);
+      env.connect(panner);
+      panner.connect(ctx.destination);
+      source.start(t);
+      source.stop(t + 0.05);
+    }
   }
 
   // One-shot "dodge window is open" telegraph: a rising sweep, deliberately
@@ -595,7 +593,7 @@ export class FearAudio {
     if (!this._started) return;
     const now = this.ctx.currentTime;
 
-    this._updateMusic(now);
+    this._music.update(now);
 
     // 60+: "the world" (music) muffles under a closing lowpass — the
     // lock-tone/approach-ping/heartbeat deliberately stay untouched, since

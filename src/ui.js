@@ -51,6 +51,7 @@ export class UI {
     this._panicLine = '';
 
     this._debugVisible = false; // D key — fear economy overlay, see _drawDebugOverlay
+    this._fighterDebugVisible = false; // T key — fighter state/distance/bearing overlay, see _drawFighterDebugOverlay
   }
 
   resize(width, height, dpr) {
@@ -75,6 +76,10 @@ export class UI {
 
   toggleDebug() {
     this._debugVisible = !this._debugVisible;
+  }
+
+  toggleFighterDebug() {
+    this._fighterDebugVisible = !this._fighterDebugVisible;
   }
 
   update(flight, fear, dt, threats, radio, route, audio) {
@@ -104,6 +109,7 @@ export class UI {
     this._updatePanicScreen(route, audio, dt);
     this._drawPanicScreen(route, w, h);
     this._drawDebugOverlay(fear, threats, route, w, h);
+    this._drawFighterDebugOverlay(threats, flight, w, h);
   }
 
   _updateGlitch(fear, dt) {
@@ -386,7 +392,9 @@ export class UI {
         continue;
       }
 
-      const color = c.type === 'fighter' ? '#9aa0a6' : '#dd2222';
+      // Fighter dots go orange while lining up (rear-quarter attack
+      // telegraphed — see threats.js's radarLineup), grey otherwise.
+      const color = c.type === 'fighter' ? (c.lineup ? '#ff9633' : '#9aa0a6') : '#dd2222';
 
       // Fading trail of recent positions, drawn oldest-first (so the newest
       // segment paints on top) — this is what makes an overshoot/hard-turn
@@ -642,6 +650,47 @@ export class UI {
     ctx.font = '12px "Consolas", "Courier New", monospace';
     const panelW = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 20;
     const panelH = lines.length * lineH + 12;
+
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(x, y, panelW, panelH);
+    ctx.strokeStyle = ACCENT_COLOR;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, panelW - 1, panelH - 1);
+
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    ctx.fillStyle = ACCENT_COLOR;
+    lines.forEach((line, i) => ctx.fillText(line, x + 10, y + 8 + i * lineH));
+  }
+
+  // T key — per-fighter state/distance/bearing, top-right so it doesn't
+  // collide with the D overlay. The point is telling "orbiting me" from
+  // "wandering off" at a glance during playtesting: dist/angle should stay
+  // roughly within the escort radius and the +/-120 deg front bias while
+  // PATROLling. noseDiv is threats.js's live nose-vs-actual-velocity check
+  // (see getFighterDebugInfo) — should read ~0.0 always; a nonzero value
+  // means something moved a fighter without going through _steerFighter.
+  _drawFighterDebugOverlay(threats, flight, w, h) {
+    if (!this._fighterDebugVisible) return;
+    const ctx = this.ctx;
+    const y = 40;
+    const lineH = 16;
+
+    const info = threats.getFighterDebugInfo(flight);
+    const lines = [
+      'FIGHTER DEBUG (T to hide)',
+      ...(info.length
+        ? info.map(
+            (f, i) =>
+              `#${i} ${f.state}${f.phase ? '/' + f.phase : ''}  dist:${f.dist}  angle:${f.angleDeg > 0 ? '+' : ''}${f.angleDeg}deg  noseDiv:${f.noseDivergenceDeg}deg`
+          )
+        : ['(no active fighters)']),
+    ];
+
+    ctx.font = '12px "Consolas", "Courier New", monospace';
+    const panelW = Math.max(...lines.map((l) => ctx.measureText(l).width)) + 20;
+    const panelH = lines.length * lineH + 12;
+    const x = w - panelW - 12;
 
     ctx.fillStyle = 'rgba(0,0,0,0.6)';
     ctx.fillRect(x, y, panelW, panelH);

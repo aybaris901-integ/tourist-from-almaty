@@ -9,7 +9,7 @@ const getLine = (id) => RADIO_LINES.find((l) => l.id === id);
 export const WAVES = [
   {
     country: 'Kazakhstan',
-    musicKey: 'kazakhstan', // audio.js's per-country synthesized loop (see setMusicCountry)
+    musicKey: 'kazakhstan', // audio.js's per-country music track (see setMusicCountry/musicManager.js)
     duration: 95, // seconds of flight time before the next transition
     missileSpawnMin: 25,
     missileSpawnMax: 35,
@@ -19,8 +19,8 @@ export const WAVES = [
     dodgeWindowEnter: 900, // wider than the 700 default: generous tutorial timing
     dodgeWindowBreak: 650,
     missilesPerSpawn: 1,
-    fighterCount: 0,
-    fighterCanShoot: false,
+    fighterCount: 1, // PATROL-only escort — present from the very first wave, never attacks here
+    fighterCanAttack: false,
     calmMin: 20,
     calmMax: 25,
     activeMin: 40,
@@ -63,7 +63,7 @@ export const WAVES = [
     dodgeWindowBreak: 575,
     missilesPerSpawn: 1,
     fighterCount: 1, // first fighter appears
-    fighterCanShoot: false,
+    fighterCanAttack: false, // PATROL only — presence and the lazy orbit, no attack runs yet
     calmMin: 15,
     calmMax: 20,
     activeMin: 30,
@@ -83,7 +83,10 @@ export const WAVES = [
     dodgeWindowBreak: 525,
     missilesPerSpawn: 1,
     fighterCount: 1,
-    fighterCanShoot: true, // gun bursts unlock, stays on for the rest of the route
+    fighterCanAttack: true, // ATTACK unlocks — rear-quarter runs, stays on for the rest of the route
+    fighterAttackIntervalMin: 14,
+    fighterAttackIntervalMax: 20,
+    fighterAccuracy: 0.25,
     calmMin: 12,
     calmMax: 18,
     activeMin: 25,
@@ -103,7 +106,10 @@ export const WAVES = [
     dodgeWindowBreak: 500,
     missilesPerSpawn: 2, // pairs
     fighterCount: 1,
-    fighterCanShoot: true,
+    fighterCanAttack: true,
+    fighterAttackIntervalMin: 10,
+    fighterAttackIntervalMax: 16,
+    fighterAccuracy: 0.35,
     calmMin: 8, // tighter calm gaps
     calmMax: 12,
     activeMin: 25,
@@ -113,7 +119,7 @@ export const WAVES = [
   },
   {
     country: 'Istanbul Approach',
-    musicKey: 'istanbul',
+    musicKey: 'turkey', // Istanbul reuses Turkey's track (one turkey.mp3 covers both, per asset naming)
     duration: 120,
     missileSpawnMin: 10,
     missileSpawnMax: 14,
@@ -123,7 +129,10 @@ export const WAVES = [
     dodgeWindowBreak: 450,
     missilesPerSpawn: 2,
     fighterCount: 2,
-    fighterCanShoot: true,
+    fighterCanAttack: true,
+    fighterAttackIntervalMin: 8,
+    fighterAttackIntervalMax: 13,
+    fighterAccuracy: 0.45,
     calmMin: 6,
     calmMax: 10,
     activeMin: 20,
@@ -272,6 +281,10 @@ export class Route {
     this.threats.setWaveConfig(wave);
     this.world.setCountry(wave);
     this.audio.setMusicCountry(wave.musicKey);
+    // Kick off the NEXT wave's track decode now, while this one plays, so
+    // there's no load gap when the player actually gets there.
+    const nextWave = WAVES[index + 1];
+    if (nextWave) this.audio.preloadMusicCountry(nextWave.musicKey);
   }
 
   _advanceWave() {

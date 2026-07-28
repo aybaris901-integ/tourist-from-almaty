@@ -91,6 +91,7 @@ resize();
 window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyF') ui.toggleFps();
   if (e.code === 'KeyD') ui.toggleDebug();
+  if (e.code === 'KeyT') ui.toggleFighterDebug();
   // Panic screen (route.phase === 'restart-flash') is the only place these
   // fire — see ui.js's panic screen and route.js's retryFromPanic().
   if (route.phase === 'restart-flash') {
