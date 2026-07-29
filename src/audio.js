@@ -22,6 +22,7 @@ const APPROACH_GAIN_NEAR = 0.45;
 // to the lock-tone/approach-ping/heartbeat, which need to stay piercing as
 // warnings regardless of how scared you are.
 const MUSIC_DUCK_GAIN = Math.pow(10, -6 / 20); // -6dB while radio.active
+const CUTSCENE_DUCK_GAIN = 0.4; // ~40% while a cutscene plays (main.js) — deeper than the radio duck, but never fully silent, so music continuity through the intro clips is audible
 const MUSIC_MUFFLE_MIN_CUTOFF = 500; // lowpass Hz at fear=100
 const MUSIC_MUFFLE_MAX_CUTOFF = 18000; // effectively unfiltered
 
@@ -212,6 +213,16 @@ export class FearAudio {
     if (!this._started) return;
     const now = this.ctx.currentTime;
     this._musicDuckGain.gain.setTargetAtTime(active ? MUSIC_DUCK_GAIN : 1, now, 0.15);
+  }
+
+  // main.js calls this around every cutscenePlayer.playCutscene() — ducks the
+  // same bus setMusicDucked() uses. Shares the node rather than adding a
+  // second one: radio.update() never runs while a cutscene has the game loop
+  // suspended, so the two ducks can't actually fight over it in practice.
+  setCutsceneDuck(active) {
+    if (!this._started) return;
+    const now = this.ctx.currentTime;
+    this._musicDuckGain.gain.setTargetAtTime(active ? CUTSCENE_DUCK_GAIN : 1, now, 0.15);
   }
 
   _playThump(bus, startFreq, endFreq, duration) {

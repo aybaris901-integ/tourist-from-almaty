@@ -106,6 +106,7 @@ export class UI {
     }
     this._drawProgressStrip(route, w, h);
     this._drawTransitionCard(route, w, h);
+    this._drawEndCard(route, w, h);
     this._updatePanicScreen(route, audio, dt);
     this._drawPanicScreen(route, w, h);
     this._drawDebugOverlay(fear, threats, route, w, h);
@@ -543,6 +544,36 @@ export class UI {
     ctx.fillStyle = 'rgba(242,242,234,0.75)';
     ctx.fillText('Entering airspace...', cx, cy + 24);
     ctx.restore();
+  }
+
+  // PLACEHOLDER end screen: route.js's Stage 7 landing sequence doesn't
+  // exist yet (see route.js's _completeRoute comment), so this is the only
+  // thing that currently marks "you made it" once finale_offering (main.js)
+  // has played and route.phase reaches 'complete' — reusing the transition
+  // card's look rather than building real end-screen UI. Replace this with
+  // the real landing/end screen once Stage 7 lands.
+  _drawEndCard(route, w, h) {
+    if (route.phase !== 'complete') return;
+    const ctx = this.ctx;
+    const cx = w / 2;
+    const cy = h / 2;
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(cx - 240, cy - 55, 480, 110);
+
+    ctx.font = '700 34px "Segoe UI", system-ui, sans-serif';
+    ctx.fillStyle = ACCENT_COLOR;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('СТАМБУЛ', cx, cy - 10);
+
+    ctx.font = '400 14px "Segoe UI", system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(242,242,234,0.75)';
+    ctx.fillText('Одеколон уже близко.', cx, cy + 24);
+    ctx.restore();
+
+    this._drawBottleIcon(w / 2, cy + 66);
   }
 
   // Detects the panic screen's rising edge (route.phase just became

@@ -91,3 +91,54 @@ html, body {
 #pointer-lock-hint.hidden {
   opacity: 0;
 }
+
+/* Fullscreen cutscene overlay (cutscenePlayer.js) — sits above everything
+   else (blackout included), since a clip must cover the whole screen
+   regardless of what state the HUD/panic-freeze/blackout are in underneath.
+   #cutscene-frame is sized in JS (resize()) to the clip's real aspect ratio,
+   letterboxed within the viewport; video/poster <img> children (inserted by
+   cutscenePlayer.js, class "cutscene-media") fill that frame exactly, so the
+   subtitle only ever sits inside the actual visible video area. */
+#cutscene {
+  position: absolute;
+  inset: 0;
+  background: #000;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+#cutscene.hidden {
+  display: none;
+}
+
+#cutscene-frame {
+  position: relative;
+}
+
+.cutscene-media {
+  display: none;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}
+
+.cutscene-media.active {
+  display: block;
+}
+
+#cutscene-subtitle {
+  position: absolute;
+  left: 4%;
+  right: 4%;
+  bottom: 6%;
+  text-align: center;
+  color: #f2f2ea;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-size: 20px;
+  font-weight: 600;
+  text-shadow: 0 0 6px rgba(0, 0, 0, 0.9), 0 2px 5px rgba(0, 0, 0, 0.9);
+  pointer-events: none;
+}
