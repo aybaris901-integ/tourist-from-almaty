@@ -7,6 +7,7 @@ import { RouteHud } from './routeHud.js';
 import { Fear } from './fear.js';
 import { PostFX } from './postfx.js';
 import { FearAudio } from './audio.js';
+import { playMenuMusic, pauseMenuMusic, setMenuMusicVolume } from './menuMusic.js';
 import { Threats } from './threats.js';
 import { Radio } from './radio.js';
 import { Route, WAVES } from './route.js';
@@ -84,6 +85,10 @@ function applySettings() {
   // audio.setVolumes() defers internally (via _pendingVolumes) until
   // resume() actually builds the audio graph, same as setMusicCountry().
   audio.setVolumes({ master: settings.masterVolume, music: settings.musicVolume, sfx: settings.sfxVolume });
+  // menuMusic.js has no separate master/music gain stages (just one
+  // <audio> element) — combine the two sliders the same way they'd
+  // multiply together in audio.js's graph.
+  setMenuMusicVolume(settings.masterVolume * settings.musicVolume);
 }
 applySettings();
 
@@ -271,20 +276,6 @@ function pauseMenuVideo() {
   if (!menuVideoEl.paused) menuVideoEl.pause();
 }
 
-// --- Menu shell background music -------------------------------------------
-// AudioContext can only be created/resumed from a user gesture (see
-// audio.js's resume()) — startNewGame() already does this, but that's too
-// late for menu music: by the time the player clicks ЛЕТЕТЬ, the click is
-// starting the game, not just unlocking audio. Piggyback on the page's very
-// first pointerdown/keydown instead — self-removing ({once: true}), and
-// audio.resume() is itself idempotent (see FearAudio._started), so this
-// never fights with startNewGame()'s own call.
-function unlockAudioOnce() {
-  audio.resume();
-}
-window.addEventListener('pointerdown', unlockAudioOnce, { once: true });
-window.addEventListener('keydown', unlockAudioOnce, { once: true });
-
 // logo.png ships with a flat background — no image-editing tool was
 // available to pre-process the file, so this chroma-keys it out at runtime
 // (see menu.js). Falls back to the original file (already the <img>'s src
@@ -298,10 +289,11 @@ stripFlatBackground(MENU_LOGO_URL)
 function showMenuShell() {
   menuShellEl.classList.remove('hidden');
   playMenuVideo();
-  // Idempotent per MusicManager.setCountry (no-op if 'menu' is already the
-  // current key) and deferred internally if audio hasn't unlocked yet — same
-  // pending-key mechanism route.js's _applyWave relies on for wave tracks.
-  audio.setMusicCountry('menu');
+  // menuMusic.js already started loading this at import time — this just
+  // (re)starts/reuses the same persistent <audio> instance. If autoplay is
+  // blocked (no user gesture yet), it retries itself on the page's first
+  // pointerdown/keydown.
+  playMenuMusic();
   mainMenu.open('main', buildMainMenuItems);
 }
 
@@ -309,6 +301,7 @@ function hideMenuShell() {
   mainMenu.close();
   menuShellEl.classList.add('hidden');
   pauseMenuVideo();
+  pauseMenuMusic();
 }
 
 // --- Credits ---------------------------------------------------------------

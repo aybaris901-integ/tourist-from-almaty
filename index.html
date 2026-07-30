@@ -11,6 +11,11 @@
     rel="stylesheet"
   />
   <link rel="stylesheet" href="/src/style.css" />
+  <!-- Main-menu background music (see src/menuMusic.js) — gives the browser
+       a head start on the fetch alongside the module-level `new Audio()` /
+       `load()` call, so the request is already in flight before any JS
+       has even had a chance to run. -->
+  <link rel="preload" href="/audio/music/background.mp3" as="audio" />
 </head>
 <body>
   <div id="app">

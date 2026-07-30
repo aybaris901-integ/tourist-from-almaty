@@ -15,7 +15,8 @@
       "Bash(sed -i '199!s/connect\\(this\\\\._sfxGain\\)/connect\\(this._sfxSuspendGain\\)/' src/audio.js)",
       "Bash(sed -i 's/\\(this\\\\._sfxGain,/\\(this._sfxSuspendGain,/' src/audio.js)",
       "Bash(powershell -NoProfile -Command \"Stop-Process -Id 540 -Force\")",
-      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 13104 -Force\")"
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 13104 -Force\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 1368,12144 -Force\")"
     ]
   }
 }

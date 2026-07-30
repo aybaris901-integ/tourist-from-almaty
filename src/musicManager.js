@@ -8,11 +8,11 @@ const CROSSFADE_SECONDS = 1.5; // "~1-2 seconds" per spec
 
 // route.js's WAVES musicKey -> file under /public/audio/music/. Istanbul
 // reuses Turkey's key directly in WAVES (see route.js) rather than having a
-// second entry here pointing at the same file. 'menu' is main.js's main-menu
-// background track (see showMenuShell) — same crossfade/loop machinery as
-// every country track, just keyed off the menu instead of a wave.
+// second entry here pointing at the same file. Menu music is a separate,
+// plain <audio> element (see menuMusic.js) — it doesn't need this system's
+// AudioContext-gated crossfade/ducking, and gating it here is what caused
+// the menu track to not even start loading until the AudioContext unlocked.
 const TRACKS = {
-  menu: '/audio/music/background.mp3',
   kazakhstan: '/audio/music/kazakhstan.mp3',
   azerbaijan: '/audio/music/azerbaijan.mp3',
   georgia: '/audio/music/georgia.mp3',
