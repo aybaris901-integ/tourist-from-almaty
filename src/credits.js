@@ -6,14 +6,18 @@ export const CREDITS_HTML = `
   <p>Добрался.</p>
 
   <h2>3D Models</h2>
-  <p>Cockpit — author/license not on file.<br />
-  F-16 fighter — Sketchfab export; original listing/author/license not on file.</p>
+  <p>
+    <a href="https://skfb.ly/6QTwx" target="_blank" rel="noopener noreferrer">"Cockpit Model Vr"</a> by chiefpad is licensed under
+    <a href="http://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer">Creative Commons Attribution</a>.<br />
+    <a href="https://skfb.ly/6RZJM" target="_blank" rel="noopener noreferrer">"F-16 Fighter Jet"</a> by iedalton is licensed under
+    <a href="http://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener noreferrer">Creative Commons Attribution</a>.
+  </p>
 
   <h2>Music</h2>
-  <p>Kazakhstan, Caspian/Azerbaijan, Georgia, Turkey/Istanbul tracks — author/license not on file.</p>
+  <p>Music by Aybaris Zhenisuly.</p>
 
   <h2>Cutscenes</h2>
-  <p>Bedroom intro, cologne intro, cockpit reveal, per-country flyovers, finale — production credits not on file.</p>
+  <p>Cutscenes created with Higgsfield.</p>
 
   <h2>Engine</h2>
   <p>Built with three.js and Vite.</p>

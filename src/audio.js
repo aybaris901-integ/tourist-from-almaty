@@ -26,6 +26,15 @@ const CUTSCENE_DUCK_GAIN = 0.4; // ~40% while a cutscene plays (main.js) — dee
 const MUSIC_MUFFLE_MIN_CUTOFF = 500; // lowpass Hz at fear=100
 const MUSIC_MUFFLE_MAX_CUTOFF = 18000; // effectively unfiltered
 
+// PAUSED / panic screen / MENU (see setSuspended, called from main.js on
+// every transition off FLYING that isn't already covered by the cutscene
+// duck): music ducks to 25%, everything on _sfxSuspendGain (breathing,
+// heartbeat, engine drone, RWR lock tone/approach ping — every gameplay sfx
+// one-shot too) goes silent. A flat 200ms linear ramp either direction, so
+// nothing lingers audibly the instant the game loop freezes.
+const PAUSE_MUSIC_DUCK_GAIN = 0.25;
+const PAUSE_RAMP_SECONDS = 0.2;
+
 // Radio voice: Animal-Crossing-style gibberish, a distinct pitch profile per
 // character (radio_lines.json's `speaker` field) so Bagdat and the NATO
 // pilot are audibly different, not the same blip replayed.
@@ -102,7 +111,10 @@ export class FearAudio {
         this.setVolumes(volumes);
       }
     }
-    if (this.ctx.state === 'suspended') this.ctx.resume();
+    if (this.ctx.state === 'suspended') {
+      const p = this.ctx.resume();
+      if (p && p.catch) p.catch(() => {});
+    }
   }
 
   _buildNoiseBuffer() {
@@ -128,14 +140,14 @@ export class FearAudio {
 
     source.connect(filter);
     filter.connect(this._breathGain);
-    this._breathGain.connect(this._sfxGain);
+    this._breathGain.connect(this._sfxSuspendGain);
     source.start();
   }
 
   _buildHeartbeatBus() {
     this._heartbeatBus = this.ctx.createGain();
     this._heartbeatBus.gain.value = 0;
-    this._heartbeatBus.connect(this._sfxGain);
+    this._heartbeatBus.connect(this._sfxSuspendGain);
   }
 
   // Persistent low drone for a nearby fighter (threats.js's _updateFighters
@@ -161,16 +173,16 @@ export class FearAudio {
     osc.connect(filter);
     filter.connect(this._engineGain);
     this._engineGain.connect(this._enginePanner);
-    this._enginePanner.connect(this._sfxGain);
+    this._enginePanner.connect(this._sfxSuspendGain);
     osc.start();
     this._engineOsc = osc;
   }
 
   // Stage 7B settings: everything ends up at _masterGain -> destination.
-  // Sfx (one-shots, breathing/heartbeat/engine) route through _sfxGain;
-  // music gets its own _musicVolumeGain (see _buildMusicBus) so the two
-  // sliders are independent. Built first, before anything that connects to
-  // either bus.
+  // Sfx (one-shots, breathing/heartbeat/engine) route through
+  // _sfxSuspendGain -> _sfxGain; music gets its own _musicVolumeGain (see
+  // _buildMusicBus) so the two sliders are independent. Built first, before
+  // anything that connects to either bus.
   _buildMasterBus() {
     const ctx = this.ctx;
     this._masterGain = ctx.createGain();
@@ -180,12 +192,21 @@ export class FearAudio {
     this._sfxGain = ctx.createGain();
     this._sfxGain.gain.value = 1;
     this._sfxGain.connect(this._masterGain);
+
+    // Pause/panic/menu mute point for every gameplay sfx source (breathing,
+    // heartbeat, engine drone, RWR beeps, every one-shot) — sits in front of
+    // _sfxGain so muting it never disturbs the user's own sfx-volume
+    // setting. See setSuspended().
+    this._sfxSuspendGain = ctx.createGain();
+    this._sfxSuspendGain.gain.value = 1;
+    this._sfxSuspendGain.connect(this._sfxGain);
   }
 
   // Fear-reactive chain that MusicManager's real playback feeds into:
   // MusicManager -> _musicBus (mix point) -> _musicFilter ("muffle the
   // world" lowpass, see update()) -> _musicDuckGain (transient ducking —
-  // radio/cutscene, see setMusicDucked/setCutsceneDuck) -> _musicVolumeGain
+  // radio/cutscene, see setMusicDucked/setCutsceneDuck) -> _pauseDuckGain
+  // (pause/panic/menu duck, see setSuspended) -> _musicVolumeGain
   // (persistent user music-volume setting, see setVolumes) -> _masterGain.
   _buildMusicBus() {
     const ctx = this.ctx;
@@ -199,12 +220,16 @@ export class FearAudio {
     this._musicDuckGain = ctx.createGain();
     this._musicDuckGain.gain.value = 1;
 
+    this._pauseDuckGain = ctx.createGain();
+    this._pauseDuckGain.gain.value = 1;
+
     this._musicVolumeGain = ctx.createGain();
     this._musicVolumeGain.gain.value = 1;
 
     this._musicBus.connect(this._musicFilter);
     this._musicFilter.connect(this._musicDuckGain);
-    this._musicDuckGain.connect(this._musicVolumeGain);
+    this._musicDuckGain.connect(this._pauseDuckGain);
+    this._pauseDuckGain.connect(this._musicVolumeGain);
     this._musicVolumeGain.connect(this._masterGain);
 
     this._music = new MusicManager(ctx, this._musicBus);
@@ -257,6 +282,25 @@ export class FearAudio {
     this._musicDuckGain.gain.setTargetAtTime(target, now, 0.15);
   }
 
+  // main.js calls this on every transition off/onto FLYING that isn't a
+  // cutscene (PAUSED, the panic screen, MENU) — separate node from
+  // _musicDuckGain/setCutsceneDuck so it can't clobber (or be clobbered by)
+  // an in-progress radio-call duck; the two multiply together instead.
+  // Silences _sfxSuspendGain outright (breathing, heartbeat, engine drone,
+  // RWR lock tone/approach ping, every one-shot) rather than just ducking it,
+  // since none of that should be audible at all once the game loop freezes.
+  setSuspended(active) {
+    if (!this._started) return;
+    const now = this.ctx.currentTime;
+    const ramp = (param, target) => {
+      param.cancelScheduledValues(now);
+      param.setValueAtTime(param.value, now);
+      param.linearRampToValueAtTime(target, now + PAUSE_RAMP_SECONDS);
+    };
+    ramp(this._sfxSuspendGain.gain, active ? 0 : 1);
+    ramp(this._pauseDuckGain.gain, active ? PAUSE_MUSIC_DUCK_GAIN : 1);
+  }
+
   // route.js's calm-payoff -> landing sequence: a warm sustained chord layered
   // over whatever country track is already playing, synthesized rather than
   // a new music asset (no "final track" mp3 exists — see CLAUDE.md's "no huge
@@ -281,7 +325,7 @@ export class FearAudio {
       env.gain.exponentialRampToValueAtTime(0.001, now + 13);
 
       osc.connect(env);
-      env.connect(this._sfxGain);
+      env.connect(this._sfxSuspendGain);
       osc.start(now);
       osc.stop(now + 13.2);
     });
@@ -313,11 +357,11 @@ export class FearAudio {
 
     source.connect(filter);
     filter.connect(env);
-    env.connect(this._sfxGain);
+    env.connect(this._sfxSuspendGain);
     source.start(now);
     source.stop(now + duration + 0.05);
 
-    this._playThump(this._sfxGain, 160, 60, 0.25, now + duration - 0.05);
+    this._playThump(this._sfxSuspendGain, 160, 60, 0.25, now + duration - 0.05);
   }
 
   // Landing sequence: touchdown — a heavy low thump plus a short rumble.
@@ -326,7 +370,7 @@ export class FearAudio {
     const ctx = this.ctx;
     const now = ctx.currentTime;
 
-    this._playThump(this._sfxGain, 110, 30, 0.5);
+    this._playThump(this._sfxSuspendGain, 110, 30, 0.5);
 
     const source = ctx.createBufferSource();
     source.buffer = this._noiseBuffer;
@@ -338,7 +382,7 @@ export class FearAudio {
     env.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
     source.connect(filter);
     filter.connect(env);
-    env.connect(this._sfxGain);
+    env.connect(this._sfxSuspendGain);
     source.start(now);
     source.stop(now + 0.45);
   }
@@ -418,7 +462,7 @@ export class FearAudio {
 
     osc.connect(env);
     env.connect(panner);
-    panner.connect(this._sfxGain);
+    panner.connect(this._sfxSuspendGain);
     osc.start(now);
     osc.stop(now + 0.08);
   }
@@ -511,7 +555,7 @@ export class FearAudio {
 
       osc.connect(env);
       env.connect(panner);
-      panner.connect(this._sfxGain);
+      panner.connect(this._sfxSuspendGain);
       osc.start(t);
       osc.stop(t + 0.05);
     }
@@ -548,7 +592,7 @@ export class FearAudio {
       source.connect(filter);
       filter.connect(env);
       env.connect(panner);
-      panner.connect(this._sfxGain);
+      panner.connect(this._sfxSuspendGain);
       source.start(t);
       source.stop(t + 0.05);
     }
@@ -575,7 +619,7 @@ export class FearAudio {
     env.gain.exponentialRampToValueAtTime(0.001, now + duration);
 
     osc.connect(env);
-    env.connect(this._sfxGain);
+    env.connect(this._sfxSuspendGain);
     osc.start(now);
     osc.stop(now + duration + 0.02);
   }
@@ -602,14 +646,14 @@ export class FearAudio {
 
     source.connect(filter);
     filter.connect(env);
-    env.connect(this._sfxGain);
+    env.connect(this._sfxSuspendGain);
     source.start(now);
     source.stop(now + duration + 0.02);
   }
 
   playImpactThud() {
     if (!this._started) return;
-    this._playThump(this._sfxGain, 90, 35, 0.35);
+    this._playThump(this._sfxSuspendGain, 90, 35, 0.35);
   }
 
   // Short ascending major arpeggio, layered right alongside playWhoosh() on
@@ -636,7 +680,7 @@ export class FearAudio {
       env.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
 
       osc.connect(env);
-      env.connect(this._sfxGain);
+      env.connect(this._sfxSuspendGain);
       osc.start(t);
       osc.stop(t + 0.32);
     });
@@ -665,7 +709,7 @@ export class FearAudio {
 
       source.connect(filter);
       filter.connect(env);
-      env.connect(this._sfxGain);
+      env.connect(this._sfxSuspendGain);
       source.start(t);
       source.stop(t + 0.08);
     }
@@ -716,7 +760,7 @@ export class FearAudio {
 
     osc.connect(formant);
     formant.connect(env);
-    env.connect(this._sfxGain);
+    env.connect(this._sfxSuspendGain);
     osc.start(time);
     osc.stop(time + dur + 0.02);
   }
@@ -746,7 +790,7 @@ export class FearAudio {
 
     source.connect(filter);
     filter.connect(env);
-    env.connect(this._sfxGain);
+    env.connect(this._sfxSuspendGain);
     source.start(time);
     source.stop(time + duration + 0.02);
   }

@@ -110,10 +110,11 @@ export class UI {
       this._drawRadio(radio, w, h);
     }
     if (!inPanicScreen) this._drawReadouts(flight, fear, w, h);
-    if (!inLanding) {
-      this._drawProgressStrip(route, w, h);
-      this._drawTransitionCard(route, w, h);
-    }
+    // Route progress used to be drawn here too (5 dots + a bottle icon) —
+    // replaced by the DOM/CSS route HUD (see routeHud.js), driven from
+    // main.js's render loop so it can use real inline SVG flags and the
+    // actual kolonya.png asset instead of canvas primitives.
+    if (!inLanding) this._drawTransitionCard(route, w, h);
     this._updatePanicScreen(route, audio, dt);
     this._drawPanicScreen(route, w, h);
     this._drawDebugOverlay(fear, threats, route, w, h);
@@ -501,38 +502,9 @@ export class UI {
     ctx.fillRect(x + 16, y + 88, barW * Math.max(0, Math.min(1, frac)), 4);
   }
 
-  // 5 dots (one per wave) + a tiny bottle icon at the end for Istanbul.
-  _drawProgressStrip(route, w, h) {
-    const ctx = this.ctx;
-    const count = WAVES.length;
-    const spacing = 32;
-    const totalW = spacing * (count - 1);
-    const startX = w / 2 - totalW / 2;
-    const y = 24;
-
-    for (let i = 0; i < count; i++) {
-      const x = startX + i * spacing;
-      const isCurrent = i === route.waveIndex;
-      const isPast = i < route.waveIndex;
-      const r = isCurrent ? 7 : 5;
-
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fillStyle = isCurrent ? ACCENT_COLOR : isPast ? 'rgba(245,197,24,0.55)' : 'rgba(255,255,255,0.25)';
-      ctx.fill();
-      if (isCurrent) {
-        ctx.strokeStyle = 'rgba(255,255,255,0.8)';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-      }
-    }
-
-    const bx = startX + spacing * (count - 1) + 24;
-    this._drawBottleIcon(bx, y);
-  }
-
-  // The signature yellow cologne bottle, small and uncaptioned — used on the
-  // progress strip (Istanbul's marker) and the panic screen's corner icon.
+  // The signature yellow cologne bottle, small and uncaptioned — the panic
+  // screen's corner icon (the route strip's own bottle is real DOM/CSS now,
+  // see routeHud.js).
   _drawBottleIcon(x, y) {
     const ctx = this.ctx;
     ctx.fillStyle = ACCENT_COLOR;

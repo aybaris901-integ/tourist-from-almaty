@@ -3,6 +3,7 @@ import { World } from './world.js';
 import { Flight, CONFIG as FlightConfig, DEFAULT_MOUSE_SENSITIVITY } from './flight.js';
 import { Cockpit } from './cockpit.js';
 import { UI } from './ui.js';
+import { RouteHud } from './routeHud.js';
 import { Fear } from './fear.js';
 import { PostFX } from './postfx.js';
 import { FearAudio } from './audio.js';
@@ -41,6 +42,7 @@ const pauseOverlayEl = document.getElementById('pause-overlay');
 const pauseScreensEl = document.getElementById('pause-screens');
 const panicOverlayEl = document.getElementById('panic-overlay');
 const panicScreensEl = document.getElementById('panic-screens');
+const routeHudEl = document.getElementById('route-hud');
 
 const renderer = new THREE.WebGLRenderer({ canvas: sceneCanvas, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -55,6 +57,7 @@ const world = new World(scene);
 const flight = new Flight(camera, sceneCanvas);
 const cockpit = new Cockpit(camera);
 const ui = new UI(hudCanvas, fpsElement);
+const routeHud = new RouteHud(routeHudEl);
 const fear = new Fear();
 const postfx = new PostFX(renderer, scene, camera);
 const audio = new FearAudio();
@@ -268,6 +271,20 @@ function pauseMenuVideo() {
   if (!menuVideoEl.paused) menuVideoEl.pause();
 }
 
+// --- Menu shell background music -------------------------------------------
+// AudioContext can only be created/resumed from a user gesture (see
+// audio.js's resume()) — startNewGame() already does this, but that's too
+// late for menu music: by the time the player clicks ЛЕТЕТЬ, the click is
+// starting the game, not just unlocking audio. Piggyback on the page's very
+// first pointerdown/keydown instead — self-removing ({once: true}), and
+// audio.resume() is itself idempotent (see FearAudio._started), so this
+// never fights with startNewGame()'s own call.
+function unlockAudioOnce() {
+  audio.resume();
+}
+window.addEventListener('pointerdown', unlockAudioOnce, { once: true });
+window.addEventListener('keydown', unlockAudioOnce, { once: true });
+
 // logo.png ships with a flat background — no image-editing tool was
 // available to pre-process the file, so this chroma-keys it out at runtime
 // (see menu.js). Falls back to the original file (already the <img>'s src
@@ -281,6 +298,10 @@ stripFlatBackground(MENU_LOGO_URL)
 function showMenuShell() {
   menuShellEl.classList.remove('hidden');
   playMenuVideo();
+  // Idempotent per MusicManager.setCountry (no-op if 'menu' is already the
+  // current key) and deferred internally if audio hasn't unlocked yet — same
+  // pending-key mechanism route.js's _applyWave relies on for wave tracks.
+  audio.setMusicCountry('menu');
   mainMenu.open('main', buildMainMenuItems);
 }
 
@@ -349,6 +370,7 @@ function enterFlying() {
   setState('FLYING');
   fear.frozen = false;
   hint.classList.add('hidden');
+  audio.setSuspended(false);
 }
 
 function canPause() {
@@ -357,6 +379,7 @@ function canPause() {
 
 function openPause() {
   setState('PAUSED');
+  audio.setSuspended(true);
   pauseOverlayEl.classList.remove('hidden');
   pauseMenu.onEscapeAtRoot = () => resumeFromPause();
   pauseMenu.open('main', buildPauseMainItems);
@@ -366,6 +389,7 @@ function resumeFromPause() {
   pauseMenu.close();
   pauseOverlayEl.classList.add('hidden');
   setState('FLYING'); // reacquires pointer lock itself
+  audio.setSuspended(false);
 }
 
 // Suspends the loop, ducks music, plays `id`, then restores whatever state
@@ -416,6 +440,7 @@ function resetGameState(waveIndex) {
   radio.resetForReplay();
   world.resetForReplay();
   audio.resetForReplay();
+  routeHud.resetForReplay();
   route = new Route(threats, world, radio, fear, audio, waveIndex);
   preloadForWave(route.waveIndex);
 
@@ -435,6 +460,7 @@ function resetToMenu() {
   resetGameState(0);
   fear.frozen = true;
   setState('MENU');
+  audio.setSuspended(true);
   showMenuShell();
 }
 
@@ -637,6 +663,7 @@ renderer.setAnimationLoop(() => {
       wasInPanicScreen = inPanicScreen;
       if (inPanicScreen) {
         if (document.pointerLockElement === sceneCanvas) document.exitPointerLock();
+        audio.setSuspended(true);
         panicOverlayEl.classList.remove('hidden');
         panicMenu.onEscapeAtRoot = () => exitPanicToMenu();
         panicMenu.open('main', buildPanicItems);
@@ -646,6 +673,7 @@ renderer.setAnimationLoop(() => {
         // branch never runs for that path) — reacquire lock to keep flying.
         panicMenu.close();
         panicOverlayEl.classList.add('hidden');
+        audio.setSuspended(false);
         const req = sceneCanvas.requestPointerLock();
         if (req && req.catch) req.catch(() => {});
       }
@@ -702,6 +730,11 @@ renderer.setAnimationLoop(() => {
     cockpit.update(flight.stick, fear, gameDt);
     ui.update(flight, fear, dt, threats, radio, route, audio, settings.simpleGraphics);
     audio.update(dt, fear);
+    // Matches the old canvas progress strip's own visibility rule (drawn
+    // whenever !inLanding) — hidden during the scripted landing rollout,
+    // visible everywhere else in FLYING including the panic screen.
+    routeHud.setVisible(route.phase !== 'landing');
+    routeHud.update(route, flight);
     hudCanvas.style.opacity = suspendFlight ? landing.hudAlpha : 1;
     blackout.style.opacity = fear.panicBlackAlpha;
     // Упрощённая графика: skip the postfx composer entirely (cheaper for a
@@ -732,6 +765,7 @@ renderer.setAnimationLoop(() => {
     world.update(flight.position, dt);
     cockpit.update(flight.stick, fear, dt);
     renderer.render(scene, camera);
+    routeHud.setVisible(false);
   }
   // state === 'CUTSCENE'/'PAUSED': loop fully suspended — the cutscene
   // overlay/pause overlay covers the relevant part of the viewport, and

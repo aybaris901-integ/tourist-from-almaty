@@ -543,10 +543,384 @@ html, body {
   font-size: 15px;
   line-height: 1.6;
   color: rgba(242, 242, 234, 0.85);
+  max-width: 640px;
+}
+
+/* Attribution links (3D model titles, CC BY license) — underline-only so
+   they read as clickable without competing with the yellow section
+   headings; brightens to the full accent color on hover/focus. */
+#credits a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgba(245, 197, 24, 0.55);
+  text-underline-offset: 2px;
+  transition: color 0.15s ease, text-decoration-color 0.15s ease;
+}
+
+#credits a:hover,
+#credits a:focus-visible {
+  color: #f5c518;
+  text-decoration-color: #f5c518;
 }
 
 #credits .credits-hint {
   margin-top: 2em;
   font-size: 13px;
   color: rgba(242, 242, 234, 0.6);
+}
+
+@media (max-width: 700px) {
+  #credits p {
+    font-size: 13px;
+    line-height: 1.65;
+    max-width: 88vw;
+  }
+}
+
+/* Route HUD (routeHud.js) — one unified strip: 5 country flags + the
+   cologne-bottle reward as a 6th node, all on one baseline, top center.
+   z-index 3: above #scene/#panic-freeze/#hud (0/1/2) so it reads as part of
+   the live HUD, but below #blackout (5) so the panic-blackout flash still
+   covers it. Every overlay above it (menu-shell 12, panic-overlay 16,
+   pause-overlay 18, cutscene 20, credits 25) already sits higher, so no
+   per-state show/hide wiring is needed beyond main.js's own setVisible calls
+   for MENU vs FLYING. Sizing constants below (flag/bottle px, line offsets)
+   are duplicated between the desktop rules and the small-screen media query
+   at the bottom — the line's left/width offsets have to match whichever
+   flag/bottle size is active, since they're plain px, not computed from the
+   node elements themselves. */
+#route-hud {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  pointer-events: none;
+  display: flex;
+  justify-content: center;
+  max-width: 92vw;
+}
+
+#route-hud.hidden {
+  display: none;
+}
+
+.route-strip {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  padding: 9px 17px 8px;
+  background: rgba(5, 15, 35, 0.72);
+  border: 1px solid rgba(150, 180, 230, 0.22);
+  border-radius: 8px;
+}
+
+.route-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 13px;
+}
+
+/* The continuous route line — one track (remaining, muted blue-gray) plus
+   one fill (completed, yellow) layered on top, both spanning center-of-first-
+   flag to center-of-bottle. Sits behind the nodes (z-index 0 vs. 1) so flags/
+   bottle visually sit "on" the line rather than beside it. left/width here
+   are half the flag width (14px) and half the bottle width (17px) — see the
+   media query for the small-screen equivalents. */
+.route-line-track,
+.route-line-fill {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  height: 2px;
+  transform: translateY(-50%);
+  border-radius: 1px;
+  z-index: 0;
+}
+
+.route-line-track {
+  right: 17px;
+  background: rgba(120, 150, 200, 0.4);
+}
+
+.route-line-fill {
+  width: calc((100% - 31px) * var(--route-fill, 0));
+  background: #f5c518;
+  box-shadow: 0 0 4px rgba(245, 197, 24, 0.55);
+  transition: width 300ms ease;
+}
+
+/* Small directional chevron riding the advancing edge of the fill — always
+   at the boundary between "completed" and "remaining", so it doubles as the
+   "active segment" indicator without needing separate positioning logic. */
+.route-line-fill::after {
+  content: '';
+  position: absolute;
+  right: -4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 0;
+  height: 0;
+  border-left: 5px solid #f5c518;
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  filter: drop-shadow(0 0 2px rgba(245, 197, 24, 0.75));
+}
+
+/* Border-crossing: the fill briefly flashes brighter right as a section
+   completes (see routeHud.js's _flashCrossing) — cleaned up via
+   `animationend`, never left permanently applied. */
+@keyframes routeLineFlash {
+  0% {
+    box-shadow: 0 0 4px rgba(245, 197, 24, 0.55);
+  }
+  50% {
+    box-shadow: 0 0 15px 3px rgba(245, 197, 24, 0.95);
+  }
+  100% {
+    box-shadow: 0 0 4px rgba(245, 197, 24, 0.55);
+  }
+}
+
+.route-line-fill.route-line-fill--flash {
+  animation: routeLineFlash 180ms ease;
+}
+
+.route-flag {
+  position: relative;
+  z-index: 1;
+  width: 28px;
+  height: 18px;
+  border-radius: 2px;
+  border: 1px solid rgba(8, 12, 24, 0.6);
+  overflow: hidden;
+  opacity: 0.4;
+  transform: scale(1) translateX(0);
+  filter: saturate(1);
+  box-shadow: none;
+  transition: opacity 260ms ease, transform 260ms ease, filter 260ms ease, box-shadow 260ms ease;
+}
+
+.route-flag svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.route-flag.is-past {
+  opacity: 0.25;
+  filter: saturate(0.5);
+}
+
+.route-flag.is-upcoming {
+  opacity: 0.4;
+}
+
+.route-flag.is-current {
+  opacity: 1;
+  transform: scale(1.15);
+  filter: none;
+  box-shadow: 0 0 6px 1px rgba(245, 197, 24, 0.55);
+}
+
+/* Reserves the underline's spot at a fixed position (always rendered, just
+   invisible) so becoming/un-becoming current never shifts layout. */
+.route-flag::after {
+  content: '';
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  bottom: -4px;
+  height: 2px;
+  background: #f5c518;
+  box-shadow: 0 0 5px rgba(245, 197, 24, 0.8);
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+
+.route-flag.is-current::after {
+  opacity: 1;
+}
+
+/* The newly-current flag sliding into place on a border crossing — pure
+   transform/opacity keyframe (GPU-composited, no reflow), see routeHud.js's
+   _flashCrossing. Slides in from the "upcoming" side (positive X) since
+   travel reads left-to-right. */
+@keyframes routeFlagEnter {
+  0% {
+    transform: scale(1) translateX(7px);
+    opacity: 0.6;
+  }
+  60% {
+    transform: scale(1.2) translateX(-1px);
+  }
+  100% {
+    transform: scale(1.15) translateX(0);
+    opacity: 1;
+  }
+}
+
+.route-flag.route-flag--enter {
+  animation: routeFlagEnter 300ms ease;
+}
+
+/* The cologne bottle — the route's 6th and final node, same baseline as the
+   flags (no elevation offset). object-fit:contain on a tightly-cropped,
+   background-stripped copy of kolonya.png built at runtime (see
+   routeHud.js's loadCroppedBottle) — never a hand-redrawn or stretched
+   asset. Opacity is 3 fixed steps (0.45 upcoming / 0.8 final segment / 1
+   reached, see routeHud.js's update()), not a continuous ramp. */
+.route-bottle {
+  position: relative;
+  z-index: 1;
+  width: 34px;
+  height: 46px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: var(--bottle-opacity, 0.45);
+  transform: scale(1);
+  transition: opacity 320ms ease, transform 260ms ease;
+}
+
+.route-bottle-ring {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 30px;
+  height: 30px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(245, 197, 24, 0.6) 0%, rgba(245, 197, 24, 0) 72%);
+  opacity: calc(var(--bottle-opacity, 0.45) * 0.75);
+  transition: opacity 320ms ease;
+  pointer-events: none;
+}
+
+.route-bottle.is-reached .route-bottle-ring {
+  opacity: 1;
+}
+
+.route-bottle-img {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5));
+}
+
+/* Destination-reached: the bottle scales up and briefly back down, the ring
+   pulses — both one-shot keyframes cleaned up via `animationend` (see
+   routeHud.js's _flashReached), layered on top of the is-reached CSS
+   transition above rather than replacing it. */
+@keyframes routeBottlePulse {
+  0% {
+    transform: scale(1);
+  }
+  35% {
+    transform: scale(1.12);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.route-bottle.route-bottle--pulse {
+  animation: routeBottlePulse 500ms ease;
+}
+
+@keyframes routeRingPulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(245, 197, 24, 0.7);
+  }
+  60% {
+    box-shadow: 0 0 18px 6px rgba(245, 197, 24, 0.85);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(245, 197, 24, 0);
+  }
+}
+
+.route-bottle--pulse .route-bottle-ring {
+  animation: routeRingPulse 500ms ease;
+}
+
+.route-status {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: rgba(224, 232, 250, 0.8);
+  white-space: nowrap;
+}
+
+/* Fixed-width reserved slot for the distance value so digit-count changes
+   (e.g. "80 KM" -> "120 KM") never nudge the rest of the line or the HUD's
+   own width (which is driven by .route-row above, not by this text). */
+.route-status-distance {
+  display: inline-block;
+  min-width: 58px;
+  text-align: left;
+  color: #f5c518;
+  font-weight: 600;
+}
+
+.route-status.is-reached .route-status-label {
+  color: #f5c518;
+  font-weight: 600;
+}
+
+@media (max-width: 700px) {
+  .route-strip {
+    padding: 7px 12px 6px;
+    gap: 4px;
+  }
+
+  .route-row {
+    gap: 8px;
+  }
+
+  .route-flag {
+    width: 23px;
+    height: 15px;
+  }
+
+  .route-line-track,
+  .route-line-fill {
+    left: 11.5px;
+  }
+
+  .route-line-track {
+    right: 14.5px;
+  }
+
+  .route-line-fill {
+    width: calc((100% - 26px) * var(--route-fill, 0));
+  }
+
+  .route-bottle {
+    width: 29px;
+    height: 39px;
+  }
+
+  .route-bottle-ring {
+    width: 25px;
+    height: 25px;
+  }
+
+  .route-status {
+    font-size: 9.5px;
+    gap: 3px;
+  }
+
+  .route-status-distance {
+    min-width: 48px;
+  }
 }

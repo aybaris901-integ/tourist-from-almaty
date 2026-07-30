@@ -11,7 +11,11 @@
       "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:5183/)",
       "Bash(curl -s http://localhost:5183/)",
       "Bash(git status *)",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(sed -i '199!s/connect\\(this\\\\._sfxGain\\)/connect\\(this._sfxSuspendGain\\)/' src/audio.js)",
+      "Bash(sed -i 's/\\(this\\\\._sfxGain,/\\(this._sfxSuspendGain,/' src/audio.js)",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 540 -Force\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Id 13104 -Force\")"
     ]
   }
 }
