@@ -8,7 +8,14 @@ const RAW = [
   { id: 'flyover_azerbaijan', duration: 4 },
   { id: 'flyover_caucasus', duration: 4 }, // clip covers the Georgia wave (route.js's WAVES[2].country) — id renamed from the misleading "flyover_greece" the asset shipped as
   { id: 'flyover_turkey', duration: 5 },
-  { id: 'finale_offering', duration: 4 },
+  // The finale handoff (stage 7A): unlike every other clip, this one's own
+  // audio matters (see main.js/audio.js's stopMusic) so it isn't muted, its
+  // skip prompt is deliberately slower/visible, Escape is allowed to skip it
+  // (every other clip excludes Escape — see cutscenePlayer.js — since it's
+  // also the pointer-lock-exit key mid-gameplay, a conflict that doesn't
+  // exist here), and a failed load falls back to a text card instead of a
+  // (nonexistent) poster image.
+  { id: 'finale_offering', duration: 4, skipDelay: 3, escSkips: true, unmuted: true, fallbackText: 'Добрался.' },
 ];
 
 export const CUTSCENES = RAW.map((c) => ({

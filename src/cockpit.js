@@ -112,6 +112,10 @@ export class Cockpit {
     this._bottleRattleVelZ = { value: 0 };
     this._bottleRattleRetargetTimer = 0;
 
+    // Calm payoff's "bottle catches a highlight" — see triggerBottleHighlight().
+    this._highlightTimer = 0;
+    this._highlightDuration = 2.5;
+
     this._buildBottle();
     this._bindDebugKeys();
     this._loadModel();
@@ -323,6 +327,12 @@ export class Cockpit {
     });
   }
 
+  // Calm payoff, one-shot: a warm glow rises and fades on the bottle over
+  // _highlightDuration — see update()'s emissive pulse.
+  triggerBottleHighlight() {
+    this._highlightTimer = this._highlightDuration;
+  }
+
   resize() {
     // The GLB cockpit is a real 3D object at a fixed world-scale transform,
     // not a screen-fraction graphic overlay like the old primitive build —
@@ -405,5 +415,10 @@ export class Cockpit {
       this._bottleBasePos.y,
       this._bottleBasePos.z + this._bottleRattleZ
     );
+
+    if (this._highlightTimer > 0) this._highlightTimer = Math.max(0, this._highlightTimer - dt);
+    const glow = this._highlightTimer > 0 ? Math.sin(Math.PI * (1 - this._highlightTimer / this._highlightDuration)) : 0;
+    this.bottleBody.material.emissive.setRGB(glow, glow * 0.85, glow * 0.2);
+    this.bottleLiquid.material.emissive.setRGB(glow * 0.6, glow * 0.45, glow * 0.05);
   }
 }

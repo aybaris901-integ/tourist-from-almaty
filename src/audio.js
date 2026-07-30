@@ -68,6 +68,9 @@ export class FearAudio {
     this._music = null;
     this._pendingMusicCountry = null;
     this._pendingPreloadKey = null;
+
+    // Stage 7B settings (master/music/sfx volume) — see setVolumes().
+    this._pendingVolumes = null;
   }
 
   // AudioContext must be created/resumed from a user gesture; call this from
@@ -78,6 +81,7 @@ export class FearAudio {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       this.ctx = new Ctx();
       this._buildNoiseBuffer();
+      this._buildMasterBus();
       this._buildBreathing();
       this._buildHeartbeatBus();
       this._buildFighterEngine();
@@ -91,6 +95,11 @@ export class FearAudio {
         const key = this._pendingPreloadKey;
         this._pendingPreloadKey = null;
         this.preloadMusicCountry(key);
+      }
+      if (this._pendingVolumes) {
+        const volumes = this._pendingVolumes;
+        this._pendingVolumes = null;
+        this.setVolumes(volumes);
       }
     }
     if (this.ctx.state === 'suspended') this.ctx.resume();
@@ -119,14 +128,14 @@ export class FearAudio {
 
     source.connect(filter);
     filter.connect(this._breathGain);
-    this._breathGain.connect(ctx.destination);
+    this._breathGain.connect(this._sfxGain);
     source.start();
   }
 
   _buildHeartbeatBus() {
     this._heartbeatBus = this.ctx.createGain();
     this._heartbeatBus.gain.value = 0;
-    this._heartbeatBus.connect(this.ctx.destination);
+    this._heartbeatBus.connect(this._sfxGain);
   }
 
   // Persistent low drone for a nearby fighter (threats.js's _updateFighters
@@ -152,16 +161,32 @@ export class FearAudio {
     osc.connect(filter);
     filter.connect(this._engineGain);
     this._engineGain.connect(this._enginePanner);
-    this._enginePanner.connect(ctx.destination);
+    this._enginePanner.connect(this._sfxGain);
     osc.start();
     this._engineOsc = osc;
   }
 
+  // Stage 7B settings: everything ends up at _masterGain -> destination.
+  // Sfx (one-shots, breathing/heartbeat/engine) route through _sfxGain;
+  // music gets its own _musicVolumeGain (see _buildMusicBus) so the two
+  // sliders are independent. Built first, before anything that connects to
+  // either bus.
+  _buildMasterBus() {
+    const ctx = this.ctx;
+    this._masterGain = ctx.createGain();
+    this._masterGain.gain.value = 1;
+    this._masterGain.connect(ctx.destination);
+
+    this._sfxGain = ctx.createGain();
+    this._sfxGain.gain.value = 1;
+    this._sfxGain.connect(this._masterGain);
+  }
+
   // Fear-reactive chain that MusicManager's real playback feeds into:
   // MusicManager -> _musicBus (mix point) -> _musicFilter ("muffle the
-  // world" lowpass, see update()) -> _musicDuckGain (-6dB radio duck, see
-  // setMusicDucked) -> destination. This chain is unchanged from the old
-  // synthesized version — only what feeds _musicBus changed.
+  // world" lowpass, see update()) -> _musicDuckGain (transient ducking —
+  // radio/cutscene, see setMusicDucked/setCutsceneDuck) -> _musicVolumeGain
+  // (persistent user music-volume setting, see setVolumes) -> _masterGain.
   _buildMusicBus() {
     const ctx = this.ctx;
     this._musicBus = ctx.createGain();
@@ -174,9 +199,13 @@ export class FearAudio {
     this._musicDuckGain = ctx.createGain();
     this._musicDuckGain.gain.value = 1;
 
+    this._musicVolumeGain = ctx.createGain();
+    this._musicVolumeGain.gain.value = 1;
+
     this._musicBus.connect(this._musicFilter);
     this._musicFilter.connect(this._musicDuckGain);
-    this._musicDuckGain.connect(ctx.destination);
+    this._musicDuckGain.connect(this._musicVolumeGain);
+    this._musicVolumeGain.connect(this._masterGain);
 
     this._music = new MusicManager(ctx, this._musicBus);
   }
@@ -219,15 +248,137 @@ export class FearAudio {
   // same bus setMusicDucked() uses. Shares the node rather than adding a
   // second one: radio.update() never runs while a cutscene has the game loop
   // suspended, so the two ducks can't actually fight over it in practice.
-  setCutsceneDuck(active) {
+  // `full` (the finale video only) ducks all the way to silence instead of
+  // CUTSCENE_DUCK_GAIN, since that clip's own audio needs to be heard clean.
+  setCutsceneDuck(active, { full = false } = {}) {
     if (!this._started) return;
     const now = this.ctx.currentTime;
-    this._musicDuckGain.gain.setTargetAtTime(active ? CUTSCENE_DUCK_GAIN : 1, now, 0.15);
+    const target = active ? (full ? 0 : CUTSCENE_DUCK_GAIN) : 1;
+    this._musicDuckGain.gain.setTargetAtTime(target, now, 0.15);
   }
 
-  _playThump(bus, startFreq, endFreq, duration) {
+  // route.js's calm-payoff -> landing sequence: a warm sustained chord layered
+  // over whatever country track is already playing, synthesized rather than
+  // a new music asset (no "final track" mp3 exists — see CLAUDE.md's "no huge
+  // asset downloads" rule).
+  playFinaleSwell() {
+    if (!this._started) return;
     const ctx = this.ctx;
     const now = ctx.currentTime;
+    const root = 261.63; // C4
+    const notes = [0, 4, 7, 12, 16]; // major triad + octave + tenth — warm, not tense
+
+    notes.forEach((semis, i) => {
+      const freq = root * Math.pow(2, semis / 12);
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.value = freq;
+
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(0, now);
+      env.gain.linearRampToValueAtTime(0.12, now + 2.5 + i * 0.15);
+      env.gain.linearRampToValueAtTime(0.09, now + 8);
+      env.gain.exponentialRampToValueAtTime(0.001, now + 13);
+
+      osc.connect(env);
+      env.connect(this._sfxGain);
+      osc.start(now);
+      osc.stop(now + 13.2);
+    });
+  }
+
+  // Landing sequence: gear-down whir (bandpass noise sweep) ending in a
+  // locked-down clunk.
+  playGearDown() {
+    if (!this._started) return;
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+    const duration = 1.1;
+
+    const source = ctx.createBufferSource();
+    source.buffer = this._noiseBuffer;
+    source.loop = true;
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.Q.value = 1.2;
+    filter.frequency.setValueAtTime(500, now);
+    filter.frequency.linearRampToValueAtTime(220, now + duration);
+
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0, now);
+    env.gain.linearRampToValueAtTime(0.22, now + 0.1);
+    env.gain.linearRampToValueAtTime(0.16, now + duration * 0.8);
+    env.gain.linearRampToValueAtTime(0.0001, now + duration);
+
+    source.connect(filter);
+    filter.connect(env);
+    env.connect(this._sfxGain);
+    source.start(now);
+    source.stop(now + duration + 0.05);
+
+    this._playThump(this._sfxGain, 160, 60, 0.25, now + duration - 0.05);
+  }
+
+  // Landing sequence: touchdown — a heavy low thump plus a short rumble.
+  playTouchdownThud() {
+    if (!this._started) return;
+    const ctx = this.ctx;
+    const now = ctx.currentTime;
+
+    this._playThump(this._sfxGain, 110, 30, 0.5);
+
+    const source = ctx.createBufferSource();
+    source.buffer = this._noiseBuffer;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 300;
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.35, now);
+    env.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+    source.connect(filter);
+    filter.connect(env);
+    env.connect(this._sfxGain);
+    source.start(now);
+    source.stop(now + 0.45);
+  }
+
+  // Finale video handoff: fades the raw per-country music bus itself to
+  // silence (not just the duck node) — the video's own audio needs a clean
+  // stage, and unlike the duck this doesn't get restored until a fresh
+  // playthrough (see resetForReplay()).
+  stopMusic() {
+    if (!this._started) return;
+    this._musicBus.gain.setTargetAtTime(0, this.ctx.currentTime, 0.3);
+  }
+
+  // main.js calls this when returning to MENU after the credits — undoes
+  // stopMusic()/any lingering duck so a fresh playthrough's music works.
+  resetForReplay() {
+    if (!this._started) return;
+    const now = this.ctx.currentTime;
+    this._musicBus.gain.setTargetAtTime(1, now, 0.05);
+    this._musicDuckGain.gain.setTargetAtTime(1, now, 0.05);
+  }
+
+  // menu.js's settings screen (Настройки). Deferred the same way
+  // setMusicCountry/preloadMusicCountry are if called before the
+  // AudioContext exists (main.js applies saved settings on load, before the
+  // player's first click). Any field left undefined is left unchanged.
+  setVolumes({ master, music, sfx } = {}) {
+    if (!this._started) {
+      this._pendingVolumes = { master, music, sfx }; // main.js always calls with all three set — last call wins
+      return;
+    }
+    const now = this.ctx.currentTime;
+    if (master != null) this._masterGain.gain.setTargetAtTime(master, now, 0.05);
+    if (music != null) this._musicVolumeGain.gain.setTargetAtTime(music, now, 0.05);
+    if (sfx != null) this._sfxGain.gain.setTargetAtTime(sfx, now, 0.05);
+  }
+
+  _playThump(bus, startFreq, endFreq, duration, when) {
+    const ctx = this.ctx;
+    const now = when ?? ctx.currentTime;
 
     const osc = ctx.createOscillator();
     osc.type = 'sine';
@@ -267,7 +418,7 @@ export class FearAudio {
 
     osc.connect(env);
     env.connect(panner);
-    panner.connect(ctx.destination);
+    panner.connect(this._sfxGain);
     osc.start(now);
     osc.stop(now + 0.08);
   }
@@ -360,7 +511,7 @@ export class FearAudio {
 
       osc.connect(env);
       env.connect(panner);
-      panner.connect(ctx.destination);
+      panner.connect(this._sfxGain);
       osc.start(t);
       osc.stop(t + 0.05);
     }
@@ -397,7 +548,7 @@ export class FearAudio {
       source.connect(filter);
       filter.connect(env);
       env.connect(panner);
-      panner.connect(ctx.destination);
+      panner.connect(this._sfxGain);
       source.start(t);
       source.stop(t + 0.05);
     }
@@ -424,7 +575,7 @@ export class FearAudio {
     env.gain.exponentialRampToValueAtTime(0.001, now + duration);
 
     osc.connect(env);
-    env.connect(ctx.destination);
+    env.connect(this._sfxGain);
     osc.start(now);
     osc.stop(now + duration + 0.02);
   }
@@ -451,14 +602,14 @@ export class FearAudio {
 
     source.connect(filter);
     filter.connect(env);
-    env.connect(ctx.destination);
+    env.connect(this._sfxGain);
     source.start(now);
     source.stop(now + duration + 0.02);
   }
 
   playImpactThud() {
     if (!this._started) return;
-    this._playThump(this.ctx.destination, 90, 35, 0.35);
+    this._playThump(this._sfxGain, 90, 35, 0.35);
   }
 
   // Short ascending major arpeggio, layered right alongside playWhoosh() on
@@ -485,7 +636,7 @@ export class FearAudio {
       env.gain.exponentialRampToValueAtTime(0.001, t + 0.3);
 
       osc.connect(env);
-      env.connect(ctx.destination);
+      env.connect(this._sfxGain);
       osc.start(t);
       osc.stop(t + 0.32);
     });
@@ -514,7 +665,7 @@ export class FearAudio {
 
       source.connect(filter);
       filter.connect(env);
-      env.connect(ctx.destination);
+      env.connect(this._sfxGain);
       source.start(t);
       source.stop(t + 0.08);
     }
@@ -565,7 +716,7 @@ export class FearAudio {
 
     osc.connect(formant);
     formant.connect(env);
-    env.connect(ctx.destination);
+    env.connect(this._sfxGain);
     osc.start(time);
     osc.stop(time + dur + 0.02);
   }
@@ -595,7 +746,7 @@ export class FearAudio {
 
     source.connect(filter);
     filter.connect(env);
-    env.connect(ctx.destination);
+    env.connect(this._sfxGain);
     source.start(time);
     source.stop(time + duration + 0.02);
   }

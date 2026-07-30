@@ -24,8 +24,12 @@ const MAX_ROLL = THREE.MathUtils.degToRad(60);
 const TURN_RATE = 0.7; // yaw rad/s induced per radian of roll (bank-to-turn)
 
 const STICK_DECAY = 3.5; // per-second return-to-center rate
-const MOUSE_SENSITIVITY = 0.0022;
 const KEY_STICK_RATE = 1.6; // per-second stick deflection from arrow keys
+
+// Stage 7B settings screen's default reference point — CONFIG.MOUSE_SENSITIVITY
+// is set to this times the user's slider multiplier (see settings.js/main.js's
+// applySettings()).
+export const DEFAULT_MOUSE_SENSITIVITY = 0.0022;
 
 const PITCH_SMOOTH_TIME = 0.35;
 const ROLL_SMOOTH_TIME = 0.28;
@@ -50,6 +54,7 @@ const ALT_MAX_BIAS = THREE.MathUtils.degToRad(22);
 export const CONFIG = {
   INVERT_ROLL: false,
   INVERT_PITCH: false,
+  MOUSE_SENSITIVITY: DEFAULT_MOUSE_SENSITIVITY,
 };
 
 export class Flight {
@@ -116,8 +121,8 @@ export class Flight {
       if (!this._pointerLocked) return;
       const rollSign = CONFIG.INVERT_ROLL ? 1 : -1;
       const pitchSign = CONFIG.INVERT_PITCH ? -1 : 1;
-      this.stick.x += rollSign * e.movementX * MOUSE_SENSITIVITY;
-      this.stick.y += pitchSign * e.movementY * MOUSE_SENSITIVITY;
+      this.stick.x += rollSign * e.movementX * CONFIG.MOUSE_SENSITIVITY;
+      this.stick.y += pitchSign * e.movementY * CONFIG.MOUSE_SENSITIVITY;
       this.stick.x = THREE.MathUtils.clamp(this.stick.x, -1, 1);
       this.stick.y = THREE.MathUtils.clamp(this.stick.y, -1, 1);
     });
@@ -142,6 +147,35 @@ export class Flight {
     this._impactShakeTimer = duration;
     this._impactShakeDuration = duration;
     this._impactShakeMag = magnitude;
+  }
+
+  // main.js's Stage 7A "return to MENU, not a page reload" — a pure state
+  // reset back to the same values the constructor sets, so a fresh
+  // playthrough starts identically to a real reload would. Does NOT touch
+  // any of the roll/pitch/yaw sign-chain math above (see this file's header
+  // comment) — every line here just re-initializes a field.
+  reset() {
+    this.position.set(0, 2000, 0);
+    this.yaw = 0;
+    this.pitch = 0;
+    this.roll = 0;
+    this.speed = BASE_SPEED;
+    this._pitchVel.value = 0;
+    this._rollVel.value = 0;
+    this._throttleVel.value = 0;
+    this.stick.x = 0;
+    this.stick.y = 0;
+    this._throttleInput = (1 - THROTTLE_MIN) / (THROTTLE_MAX - THROTTLE_MIN);
+    this._throttleCurrent = this._throttleInput;
+    this.tumbleActive = false;
+    this.tumbleTimer = 0;
+    this._tumbleClock = 0;
+    this._impactShakeTimer = 0;
+    this._glanceAmt = 0;
+    this._glanceVel.value = 0;
+    this._driftPhase = 0;
+    this.camera.position.copy(this.position);
+    this.camera.quaternion.identity();
   }
 
   update(dt, fear) {

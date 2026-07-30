@@ -126,6 +126,19 @@ export class Radio {
   // Above HIGH_FEAR_THRESHOLD, calls come 20% more often — the world throws
   // the player a lifeline right when fear is closing in on the 100 panic
   // threshold, instead of leaving them to sweat out a long random gap.
+  // main.js's Stage 7A "return to MENU" — a fresh Route/Threats already
+  // rebuild themselves on replay; this puts Radio's own timers/state back to
+  // constructor-initial values the same way.
+  resetForReplay() {
+    this.active = false;
+    this.subtitle = '';
+    this.options = [];
+    this.answerTimer = 0;
+    this._cooldownTimer = 0;
+    this._nextCallTimer = randRange(CONFIG.CALL_INTERVAL_MIN, CONFIG.CALL_INTERVAL_MAX);
+    this._forcedLine = null;
+  }
+
   _rollNextCallInterval() {
     const interval = randRange(CONFIG.CALL_INTERVAL_MIN, CONFIG.CALL_INTERVAL_MAX);
     const highFear = this._fear && this._fear.value > CONFIG.HIGH_FEAR_THRESHOLD;

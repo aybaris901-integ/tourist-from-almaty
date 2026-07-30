@@ -4,6 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <title>Tourist From Almaty</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@100;300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet"
+  />
   <link rel="stylesheet" href="/src/style.css" />
 </head>
 <body>
@@ -13,12 +19,40 @@
     <canvas id="hud"></canvas>
     <div id="blackout"></div>
     <div id="fps-counter"></div>
-    <div id="pointer-lock-hint">Click to fly &mdash; mouse to steer, W/S or Shift/Ctrl for throttle, F toggles FPS</div>
+    <div id="pointer-lock-hint">Mouse to steer, W/S or Shift/Ctrl for throttle, F toggles FPS &mdash; click to regain mouse control</div>
+
+    <div id="menu-shell" class="hidden">
+      <video id="menu-video" muted loop playsinline autoplay preload="auto"></video>
+      <div id="menu-dim"></div>
+      <div id="menu-vignette"></div>
+      <div id="menu-content">
+        <div id="menu-title">
+          <img id="menu-logo" src="/img/logo.png" alt="" />
+          <div id="menu-wordmark">Tourist From Almaty</div>
+          <div id="menu-tagline">3D Arcade Flight &middot; ALA &rarr; IST</div>
+        </div>
+        <div id="menu-rule"></div>
+        <div id="menu-screens"></div>
+        <div id="menu-status-strip">LEGS 05 &middot; DISTANCE 4320 KM &middot; WEAPONS NONE &middot; DUTY-FREE 1 BOTTLE</div>
+      </div>
+    </div>
+
+    <div id="pause-overlay" class="hidden">
+      <div id="pause-screens"></div>
+    </div>
+
+    <div id="panic-overlay" class="hidden">
+      <div id="panic-screens"></div>
+    </div>
+
     <div id="cutscene" class="hidden">
       <div id="cutscene-frame">
         <div id="cutscene-subtitle"></div>
+        <div id="cutscene-skip" class="hidden">Пропустить</div>
       </div>
     </div>
+    <div id="finale-fade"></div>
+    <div id="credits" class="hidden"></div>
   </div>
   <script type="module" src="/src/main.js"></script>
 </body>

@@ -82,7 +82,7 @@ export class UI {
     this._fighterDebugVisible = !this._fighterDebugVisible;
   }
 
-  update(flight, fear, dt, threats, radio, route, audio) {
+  update(flight, fear, dt, threats, radio, route, audio, simpleGraphics = false) {
     const ctx = this.ctx;
     const w = this.width;
     const h = this.height;
@@ -91,22 +91,29 @@ export class UI {
     // Panic screen replaces the whole cockpit HUD (crosshair, readouts, fear
     // bar, threats, radar, radio box) with its own full-screen presentation —
     // only the progress strip stays, so the highlighted country dot is still
-    // visible (see _drawPanicScreen's "Заново: <country>" line).
+    // visible (see _drawPanicScreen's "Заново: <country>" line). The Stage 7A
+    // landing sequence (route.phase 'landing') similarly drops the combat HUD
+    // — no more threats/radio/aiming once autopilot has the stick — keeping
+    // only the SPD/ALT readouts, which then fade with the rest of the canvas
+    // during the rollout (main.js drives hudCanvas's opacity from
+    // landing.hudAlpha, not this file).
     const inPanicScreen = route.phase === 'restart-flash';
-    if (!inPanicScreen) {
+    const inLanding = route.phase === 'landing';
+    if (!inPanicScreen && !inLanding) {
       this._updateGlitch(fear, dt);
       this._drawCrosshair(w, h);
       this._updateBreakCue(threats, dt);
       this._drawBreakCue(threats, w, h);
-      this._drawReadouts(flight, fear, w, h);
-      this._drawFearBar(fear, w, h);
+      this._drawFearBar(fear, w, h, simpleGraphics);
       this._drawThreatIndicators(threats, flight, w, h);
       this._drawRadar(threats, flight, fear, dt, w, h);
       this._drawRadio(radio, w, h);
     }
-    this._drawProgressStrip(route, w, h);
-    this._drawTransitionCard(route, w, h);
-    this._drawEndCard(route, w, h);
+    if (!inPanicScreen) this._drawReadouts(flight, fear, w, h);
+    if (!inLanding) {
+      this._drawProgressStrip(route, w, h);
+      this._drawTransitionCard(route, w, h);
+    }
     this._updatePanicScreen(route, audio, dt);
     this._drawPanicScreen(route, w, h);
     this._drawDebugOverlay(fear, threats, route, w, h);
@@ -229,9 +236,13 @@ export class UI {
   // the stakes bar it now is: wider than the old placeholder, pulsing red
   // above the WARP(80) threshold, with a skull tick marking the 100 = panic
   // line.
-  _drawFearBar(fear, w, h) {
+  _drawFearBar(fear, w, h, simpleGraphics = false) {
     const ctx = this.ctx;
-    const barW = 15;
+    // Упрощённая графика drops the postfx composer entirely (see main.js) —
+    // no vignette/aberration/warp left to sell escalating fear, so the bar
+    // itself takes over: wider, and its pulse kicks in earlier/harder (see
+    // pulseThreshold below) so the stakes still read clearly on a weak laptop.
+    const barW = simpleGraphics ? 22 : 15;
     const barH = h * 0.55;
     const x = 18;
     const yTop = (h - barH) / 2;
@@ -247,13 +258,18 @@ export class UI {
     ctx.fillStyle = `rgb(${r},${g},${b})`;
     ctx.fillRect(x, yTop + barH - fillH, barW, fillH);
 
-    // 80+: the fill (and border) throb between normal and a hot red flash —
-    // panic is one bad hit away, the bar needs to say so without words.
-    const warpIntensity = fear.intensity(FEAR_CONFIG.THRESHOLDS.WARP);
+    // 80+ normally (60+/VIGNETTE when simplified): the fill (and border)
+    // throb between normal and a hot red flash — panic is one bad hit away,
+    // the bar needs to say so without words.
+    const pulseThreshold = simpleGraphics ? FEAR_CONFIG.THRESHOLDS.VIGNETTE : FEAR_CONFIG.THRESHOLDS.WARP;
+    const warpIntensity = fear.intensity(pulseThreshold);
     if (warpIntensity > 0) {
-      const pulse = 0.5 + 0.5 * Math.sin(performance.now() * 0.012);
-      ctx.fillStyle = `rgba(255,40,40,${(0.2 + 0.5 * pulse) * warpIntensity})`;
-      ctx.fillRect(x - 2, yTop + barH - fillH - 2, barW + 4, fillH + 4);
+      const pulseSpeed = simpleGraphics ? 0.02 : 0.012;
+      const pulseGain = simpleGraphics ? 0.7 : 0.5;
+      const pad = simpleGraphics ? 4 : 2;
+      const pulse = 0.5 + 0.5 * Math.sin(performance.now() * pulseSpeed);
+      ctx.fillStyle = `rgba(255,40,40,${(0.2 + pulseGain * pulse) * warpIntensity})`;
+      ctx.fillRect(x - pad, yTop + barH - fillH - pad, barW + pad * 2, fillH + pad * 2);
     }
 
     ctx.strokeStyle = warpIntensity > 0 ? `rgba(255,80,80,${0.5 + 0.5 * warpIntensity})` : 'rgba(242,242,234,0.5)';
@@ -546,36 +562,6 @@ export class UI {
     ctx.restore();
   }
 
-  // PLACEHOLDER end screen: route.js's Stage 7 landing sequence doesn't
-  // exist yet (see route.js's _completeRoute comment), so this is the only
-  // thing that currently marks "you made it" once finale_offering (main.js)
-  // has played and route.phase reaches 'complete' — reusing the transition
-  // card's look rather than building real end-screen UI. Replace this with
-  // the real landing/end screen once Stage 7 lands.
-  _drawEndCard(route, w, h) {
-    if (route.phase !== 'complete') return;
-    const ctx = this.ctx;
-    const cx = w / 2;
-    const cy = h / 2;
-
-    ctx.save();
-    ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    ctx.fillRect(cx - 240, cy - 55, 480, 110);
-
-    ctx.font = '700 34px "Segoe UI", system-ui, sans-serif';
-    ctx.fillStyle = ACCENT_COLOR;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText('СТАМБУЛ', cx, cy - 10);
-
-    ctx.font = '400 14px "Segoe UI", system-ui, sans-serif';
-    ctx.fillStyle = 'rgba(242,242,234,0.75)';
-    ctx.fillText('Одеколон уже близко.', cx, cy + 24);
-    ctx.restore();
-
-    this._drawBottleIcon(w / 2, cy + 66);
-  }
-
   // Detects the panic screen's rising edge (route.phase just became
   // 'restart-flash') to reset its fade-in timer, pick a random dispatcher
   // line once per occurrence, and play the arrival sting — reusing
@@ -594,12 +580,12 @@ export class UI {
   }
 
   // Full-screen failure interstitial: title fades in over
-  // PANIC_TITLE_FADE_DURATION, dispatcher line, which country restarts, and
-  // two HUD-styled buttons. Sits on top of main.js's desaturated cockpit
-  // freeze-frame (#panic-freeze) — the dark scrim here keeps text readable
-  // regardless of how bright that captured frame was. Interaction is
-  // keyboard-only (Enter/Esc, handled in main.js), matching the radio's
-  // digit-key choices — this game has no mouse-driven UI anywhere else.
+  // PANIC_TITLE_FADE_DURATION, dispatcher line, which country restarts.
+  // Sits on top of main.js's desaturated cockpit freeze-frame
+  // (#panic-freeze) — the dark scrim here keeps text readable regardless of
+  // how bright that captured frame was. The two action buttons are real DOM
+  // (#panic-overlay, a MenuUI instance — see main.js) so they're properly
+  // clickable/hoverable, not canvas-drawn.
   _drawPanicScreen(route, w, h) {
     if (route.phase !== 'restart-flash') return;
     const ctx = this.ctx;
@@ -636,27 +622,9 @@ export class UI {
     ctx.fillStyle = 'rgba(242,242,234,0.75)';
     ctx.fillText(`Заново: ${WAVES[route.waveIndex].country}`, cx, cy + 4);
 
-    this._drawPanicButton(cx - 150, cy + 50, 270, 52, '[ Соберись и лети ]');
-    this._drawPanicButton(cx + 150, cy + 50, 190, 52, '[ В меню ]');
-
     ctx.restore();
 
     this._drawBottleIcon(w - 36, h - 36); // full opacity regardless of the title's fade
-  }
-
-  _drawPanicButton(centerX, y, width, height, label) {
-    const ctx = this.ctx;
-    ctx.fillStyle = 'rgba(10,14,10,0.7)';
-    ctx.fillRect(centerX - width / 2, y, width, height);
-    ctx.strokeStyle = ACCENT_COLOR;
-    ctx.lineWidth = 1.5;
-    ctx.strokeRect(centerX - width / 2 + 0.5, y + 0.5, width - 1, height - 1);
-
-    ctx.font = '700 16px "Segoe UI", system-ui, sans-serif';
-    ctx.fillStyle = ACCENT_COLOR;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(label, centerX, y + height / 2);
   }
 
   // D key — live view of the fear economy rebalance: current value vs. the

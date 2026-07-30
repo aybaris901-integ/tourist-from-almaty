@@ -1067,6 +1067,22 @@ export class Threats {
     }
   }
 
+  // main.js's Stage 7A "return to MENU" — undoes the finale's permanent
+  // this.spawningEnabled = false (see route.js's _completeRoute) and resets
+  // the wave-phase timers a fresh Route's setWaveConfig(WAVES[0]) doesn't
+  // touch itself, so a replayed Kazakhstan starts exactly like a real reload
+  // would.
+  resetForReplay() {
+    this.spawningEnabled = true;
+    this.clearAllThreats();
+    this._wavePhase = 'active';
+    this._waveTimer = randRange(this._activeMin, this._activeMax);
+    this._missilesThisWave = 0;
+    this._nextMissileTimer = randRange(this._missileSpawnMin, this._missileSpawnMax);
+    this._lockImmuneTimer = 0;
+    this.dodgeCount = 0;
+  }
+
   _spawnPuff(position, color) {
     const slot = this._puffs.find((p) => !p.active) || this._puffs[0];
     slot.active = true;

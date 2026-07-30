@@ -145,29 +145,44 @@ export const WAVES = [
 const TRANSITION_DURATION = 8; // guaranteed calm between countries
 const INTRO_CARD_DURATION = 5; // first country card at game start
 const RESTART_CALM_DURATION = 4; // breathing room once the player retries out of the panic screen
-const FINALE_CALM_DURATION = 12; // scripted calm after the last wave, before Stage 7 landing
 const RADIO_INTRO_DELAY = 6; // seconds into wave 1 before the tutorial call rings
+
+// Stage 7A finale, in-engine, after wave 5's last dodge — see main.js/landing.js
+// for the rest of the sequence (this file only owns the timing/state machine).
+const CALM_PAYOFF_DURATION = 15; // 'calm-payoff' phase: threats gone, fear force-drained, world settles
+const FEAR_DRAIN_DURATION = 8; // fear reaches 0 this far into calm-payoff, not the full 15s
 
 // Drives country/wave progression: fixed flight time per wave, then an 8s
 // transition (big text card + fog/ground retint) before the next one.
 export class Route {
-  constructor(threats, world, radio, fear, audio) {
+  // startIndex (Stage 7B's Continue/country-select) lets a fresh Route begin
+  // anywhere in WAVES instead of always Kazakhstan — there's no fine-grained
+  // mid-flight save, so "continue"/picking a country both just start that
+  // wave from its beginning. Kazakhstan's scripted tutorial/radio-intro only
+  // ever apply when actually starting there (both are gated on
+  // this.waveIndex === 0 elsewhere, same as before).
+  constructor(threats, world, radio, fear, audio, startIndex = 0) {
     this.threats = threats;
     this.world = world;
     this.radio = radio;
     this.fear = fear;
     this.audio = audio;
 
-    this.waveIndex = 0;
+    this.waveIndex = startIndex;
     this.waveElapsed = 0;
-    this.phase = 'transition'; // 'flying' | 'transition' | 'restart-flash' | 'complete'
+    // 'flying' | 'transition' | 'restart-flash' | 'calm-payoff' | 'landing' | 'complete'.
+    // calm-payoff/landing are the Stage 7A finale: this file only owns their
+    // timing/fear-drain; the scripted camera/flight path lives in landing.js
+    // and is driven by main.js (see completeLanding() below).
+    this.phase = 'transition';
     this.transitionTimer = INTRO_CARD_DURATION;
-    this.cardText = WAVES[0].country;
-    this._isFinalTransition = false;
-    this._radioIntroQueued = false;
+    this.cardText = WAVES[startIndex].country;
+    this.calmPayoffTimer = 0;
+    this._calmPayoffFearStart = 0;
+    this._radioIntroQueued = startIndex !== 0; // the Kazakhstan-only intro call never fires when starting further along
     // Kazakhstan's scripted dodge tutorial: 'briefing' -> 'waiting_to_spawn'
     // -> 'active' -> 'done'. See _updateTutorial.
-    this._tutorial = WAVES[0].scriptedTutorial
+    this._tutorial = startIndex === 0 && WAVES[0].scriptedTutorial
       ? { phase: 'briefing', timer: WAVES[0].scriptedTutorial.briefingDelay }
       : null;
 
@@ -184,24 +199,42 @@ export class Route {
     fear.onSafetyValve = () => this.radio.forceCallSoon(FEAR_CONFIG.SAFETY_VALVE_CALL_DELAY);
 
     threats.forceCalmFor(INTRO_CARD_DURATION);
-    this._applyWave(0);
-    console.log(`[route] departing ${WAVES[0].country}`);
+    this._applyWave(startIndex);
+    console.log(`[route] departing ${WAVES[startIndex].country}`);
   }
 
   update(dt, flight) {
     if (this.phase === 'transition') {
       this.transitionTimer -= dt;
       if (this.transitionTimer <= 0) {
-        if (this._isFinalTransition) {
-          this.phase = 'complete';
-          console.log('[route] Istanbul reached — awaiting landing sequence (Stage 7)');
-        } else {
-          this.phase = 'flying';
-          this.waveElapsed = 0;
-        }
+        this.phase = 'flying';
+        this.waveElapsed = 0;
       }
       return;
     }
+
+    // Stage 7A finale part 1: threats already cleared/stopped (see
+    // _completeRoute), fear force-drains from wherever it was down to 0 over
+    // FEAR_DRAIN_DURATION, then a few extra seconds of genuinely calm air
+    // before the scripted landing takes over. Runs every frame BEFORE
+    // fear.update() would otherwise get a chance to (main.js calls
+    // fear.update() first, but this overwrites its result the same frame —
+    // see fear.value being a plain public field).
+    if (this.phase === 'calm-payoff') {
+      this.calmPayoffTimer -= dt;
+      const elapsed = CALM_PAYOFF_DURATION - this.calmPayoffTimer;
+      const drainT = Math.min(1, elapsed / FEAR_DRAIN_DURATION);
+      this.fear.value = this._calmPayoffFearStart * (1 - drainT);
+      if (this.calmPayoffTimer <= 0) {
+        this.phase = 'landing';
+        console.log('[route] calm payoff done — landing sequence begins');
+      }
+      return;
+    }
+
+    // Stage 7A finale part 2: main.js/landing.js own everything here (camera,
+    // flight.position, HUD fade) — this file just waits for completeLanding().
+    if (this.phase === 'landing') return;
 
     // The panic screen waits indefinitely for the player (Enter/Esc — see
     // main.js), not a timer — but threats still need to stay off for however
@@ -302,13 +335,21 @@ export class Route {
   }
 
   _completeRoute() {
-    this.phase = 'transition';
-    this.transitionTimer = FINALE_CALM_DURATION;
-    this.cardText = 'Istanbul';
-    this._isFinalTransition = true;
+    this.phase = 'calm-payoff';
+    this.calmPayoffTimer = CALM_PAYOFF_DURATION;
+    this._calmPayoffFearStart = this.fear.value;
     this.threats.spawningEnabled = false;
-    this.threats.forceCalmFor(FINALE_CALM_DURATION);
-    console.log('[route] finale cleared — scripted calm before landing');
+    this.threats.clearAllThreats(); // instant despawn — this calm is the reward, not a natural gap
+    this.threats.forceCalmFor(CALM_PAYOFF_DURATION);
+    console.log('[route] wave 5 cleared — calm payoff begins');
+  }
+
+  // main.js calls this once landing.js's scripted sequence (camera path,
+  // touchdown, rollout) reports done — hands off to the finale video.
+  completeLanding() {
+    if (this.phase !== 'landing') return;
+    this.phase = 'complete';
+    console.log('[route] landing complete — handing off to finale video');
   }
 
   // Fear just crossed 100: freeze threats for the 2s blackout itself (fear.js's/
@@ -351,5 +392,22 @@ export class Route {
     this.phase = 'flying';
     this.threats.forceCalmFor(RESTART_CALM_DURATION);
     console.log(`[route] retrying ${WAVES[this.waveIndex].country}`);
+  }
+
+  // Stage 7B pause menu's "Рестарт страны" — a deliberate player choice, not
+  // a failure, so (unlike retryFromPanic) it also gives fear a clean reset.
+  // Only meaningful mid-flight; main.js only offers this button while
+  // phase is 'flying'/'transition' in the first place (see canPause()).
+  restartCurrentWave() {
+    if (this.phase !== 'flying' && this.phase !== 'transition') return;
+    this.threats.clearAllThreats();
+    this.fear.value = 0;
+    this.waveElapsed = 0;
+    this.phase = 'flying';
+    this.threats.forceCalmFor(RESTART_CALM_DURATION);
+    if (this.waveIndex === 0 && this._tutorial) {
+      this._tutorial = { phase: 'briefing', timer: WAVES[0].scriptedTutorial.briefingDelay };
+    }
+    console.log(`[route] restarting ${WAVES[this.waveIndex].country} (pause menu)`);
   }
 }

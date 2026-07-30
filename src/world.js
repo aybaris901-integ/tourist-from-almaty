@@ -174,6 +174,41 @@ const PALETTES = {
   kazakhstan: buildKazakhstanPalette,
 };
 
+// --- Stage 7A finale set dressing (Bosphorus/bridge/minarets/runway) ------
+// Placeholder primitive geometry only (CLAUDE.md: art passes stay
+// flat-color/procedural) — built once, at the exact distances landing.js's
+// scripted flight path will actually pass through (see World.
+// buildFinaleSetDressing, called from main.js with landing.begin()'s return
+// value).
+
+// Aligns an object's local +Z axis with `forward` (both horizontal, so this
+// is a pure yaw — no roll ambiguity) — local +X then lands on `right`
+// automatically. Used instead of PlaneGeometry's rotateX(-90) convention,
+// which is unambiguous only for axis-aligned/square geometry like the main
+// ground plane.
+function orientToPath(object, forward) {
+  object.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), forward);
+}
+
+function makeOrientedBox(width, height, depth, color) {
+  const geo = new THREE.BoxGeometry(width, height, depth);
+  const mat = new THREE.MeshToonMaterial({ color, gradientMap: TOON_GRADIENT, fog: true });
+  return new THREE.Mesh(geo, mat);
+}
+
+function buildMinaret() {
+  const group = new THREE.Group();
+  const bodyMat = new THREE.MeshToonMaterial({ color: 0xf1ead2, gradientMap: TOON_GRADIENT, fog: true });
+  const capMat = new THREE.MeshToonMaterial({ color: 0x8fae9a, gradientMap: TOON_GRADIENT, fog: true });
+  const height = randRange(150, 210);
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(13, 15, height, 10), bodyMat);
+  body.position.y = height / 2;
+  const cap = new THREE.Mesh(new THREE.ConeGeometry(18, 34, 10), capMat);
+  cap.position.y = height + 17;
+  group.add(body, cap);
+  return group;
+}
+
 function buildAlmatyLake() {
   const geo = new THREE.CircleGeometry(420, 28);
   geo.rotateX(-Math.PI / 2);
@@ -256,6 +291,16 @@ export class World {
     }
     this._decorPalette = null;
     this.almatyLake = null;
+
+    // Stage 7A finale: see beginFinaleClear/buildFinaleSetDressing below.
+    this._finaleClearActive = false;
+    this._finaleClearTimer = 0;
+    this._finaleClearDuration = 1;
+    this._finaleFogStart = FOG_DENSITY;
+    this._finaleFogTarget = FOG_DENSITY;
+    this._finaleSunStart = this.sun.intensity;
+    this._finaleSunTarget = this.sun.intensity;
+    this._finaleObjects = [];
   }
 
   // route.js calls this at every country transition: fog/ground tint (always),
@@ -292,7 +337,89 @@ export class World {
     }
   }
 
+  // Calm payoff's "world haze lifts, sun breaks through" — eases fog density
+  // down and sun intensity up over `duration` seconds. Called once, from
+  // main.js, the instant route.phase becomes 'calm-payoff'.
+  beginFinaleClear(duration) {
+    this._finaleClearActive = true;
+    this._finaleClearTimer = 0;
+    this._finaleClearDuration = duration;
+    this._finaleFogStart = this.scene.fog.density;
+    this._finaleFogTarget = FOG_DENSITY * 0.15;
+    this._finaleSunStart = this.sun.intensity;
+    this._finaleSunTarget = this.sun.intensity * 1.5;
+  }
+
+  // Placeholder Bosphorus crossing for the Stage 7A landing lowpass: a water
+  // strip + a simple suspension-bridge silhouette at `bridgeDist`, a minaret
+  // cluster near the touchdown point, and a runway strip spanning
+  // touchdownDist..totalDist. `origin`/`forward`/`right` and the distances
+  // all come straight from landing.js's begin() so the geometry lines up
+  // with the actual scripted flight path exactly.
+  buildFinaleSetDressing(origin, forward, right, { bridgeDist, touchdownDist, totalDist }) {
+    const at = (dist, lateral = 0, y = 0) =>
+      origin.clone().addScaledVector(forward, dist).addScaledVector(right, lateral).setY(y);
+
+    const water = makeOrientedBox(6000, 3, 500, 0x1f5f8b);
+    orientToPath(water, forward);
+    water.position.copy(at(bridgeDist, 0, 1));
+    this.scene.add(water);
+
+    const towerMat = 0x8b8f96;
+    const towerL = new THREE.Mesh(new THREE.CylinderGeometry(40, 46, 220, 8), new THREE.MeshToonMaterial({ color: towerMat, gradientMap: TOON_GRADIENT, fog: true }));
+    towerL.position.copy(at(bridgeDist, -950, 110));
+    const towerR = towerL.clone();
+    towerR.position.copy(at(bridgeDist, 950, 110));
+    this.scene.add(towerL, towerR);
+
+    const deck = makeOrientedBox(2100, 16, 55, 0x3d4147);
+    orientToPath(deck, forward);
+    deck.position.copy(at(bridgeDist, 0, 195));
+    this.scene.add(deck);
+
+    const minaretCount = 5;
+    for (let i = 0; i < minaretCount; i++) {
+      const minaret = buildMinaret();
+      const lateralSide = i % 2 === 0 ? 1 : -1;
+      const lateral = lateralSide * randRange(650, 1350);
+      const dist = touchdownDist + randRange(-900, 300);
+      minaret.position.copy(at(dist, lateral, 0));
+      minaret.rotation.y = Math.random() * Math.PI * 2;
+      this.scene.add(minaret);
+      this._finaleObjects.push(minaret);
+    }
+
+    const runwayStart = touchdownDist - 300;
+    const runwayEnd = totalDist + 500;
+    const runway = makeOrientedBox(60, 1.5, runwayEnd - runwayStart, 0x2b2d30);
+    orientToPath(runway, forward);
+    runway.position.copy(at((runwayStart + runwayEnd) / 2, 0, 1));
+    this.scene.add(runway);
+
+    this._finaleObjects.push(water, towerL, towerR, deck, runway);
+  }
+
+  // main.js's Stage 7A "return to MENU" — undoes beginFinaleClear()'s haze
+  // lift and removes the Bosphorus/bridge/minaret/runway set dressing so a
+  // fresh playthrough's Kazakhstan doesn't fly past a leftover runway.
+  resetForReplay() {
+    this._finaleClearActive = false;
+    this.scene.fog.density = FOG_DENSITY;
+    this.sun.intensity = 1.4; // DirectionalLight's own constructor default
+    for (const obj of this._finaleObjects) this.scene.remove(obj);
+    this._finaleObjects.length = 0;
+  }
+
   update(playerPosition, dt) {
+    if (this._finaleClearActive) {
+      this._finaleClearTimer += dt;
+      const t = Math.min(1, this._finaleClearTimer / this._finaleClearDuration);
+      const eased = t * t * (3 - 2 * t);
+      this.scene.fog.density = THREE.MathUtils.lerp(this._finaleFogStart, this._finaleFogTarget, eased);
+      this.sun.intensity = THREE.MathUtils.lerp(this._finaleSunStart, this._finaleSunTarget, eased);
+      if (t >= 1) this._finaleClearActive = false;
+    }
+
     // Recenter the ground under the player so the checker texture reads as an
     // effectively infinite surface without needing enormous geometry.
     this.ground.position.x = playerPosition.x;

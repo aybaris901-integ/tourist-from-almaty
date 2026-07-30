@@ -10,7 +10,8 @@
       "Bash(netstat -ano)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" http://localhost:5183/)",
       "Bash(curl -s http://localhost:5183/)",
-      "Bash(git status *)"
+      "Bash(git status *)",
+      "Read(//tmp/**)"
     ]
   }
 }
