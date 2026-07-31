@@ -15,23 +15,29 @@ const APPROACH_GAIN_FAR = 0.15;
 const APPROACH_GAIN_NEAR = 0.45;
 
 // --- Music -------------------------------------------------------------
-// Real per-country tracks (musicManager.js), fed into a shared fear-reactive
-// chain: MusicManager -> _musicBus (mix point) -> _musicFilter ("muffle the
-// world" lowpass, see update()) -> _musicDuckGain (-6dB while a radio call
-// is active, see setMusicDucked()) -> destination. Deliberately NOT applied
-// to the lock-tone/approach-ping/heartbeat, which need to stay piercing as
-// warnings regardless of how scared you are.
+// Every track — menu included — is one MusicManager (musicManager.js)
+// instance, so "exactly one is ever audible" is a structural property of
+// having a single crossfade primitive, not a rule several call sites each
+// have to individually respect (see setMusicForState() below, and the git
+// history it replaces: a separate menu <audio> element plus ad-hoc duck/gate
+// flags kept drifting out of sync — two tracks audible at once, or none).
+// Its output feeds a shared fear-reactive chain: MusicManager -> _musicBus
+// (mix point) -> _musicFilter ("muffle the world" lowpass, see update()) ->
+// _musicDuckGain (-6dB while a radio call is active, see setMusicDucked())
+// -> _pauseDuckGain (25% during PAUSE/PANIC, see setMusicForState()) ->
+// _musicVolumeGain (user's music slider, see setVolumes()) -> _masterGain ->
+// destination. Deliberately NOT applied to the lock-tone/approach-ping/
+// heartbeat, which need to stay piercing as warnings regardless of how
+// scared you are.
 const MUSIC_DUCK_GAIN = Math.pow(10, -6 / 20); // -6dB while radio.active
-const CUTSCENE_DUCK_GAIN = 0.4; // ~40% while a cutscene plays (main.js) — deeper than the radio duck, but never fully silent, so music continuity through the intro clips is audible
 const MUSIC_MUFFLE_MIN_CUTOFF = 500; // lowpass Hz at fear=100
 const MUSIC_MUFFLE_MAX_CUTOFF = 18000; // effectively unfiltered
 
-// PAUSED / panic screen / MENU (see setSuspended, called from main.js on
-// every transition off FLYING that isn't already covered by the cutscene
-// duck): music ducks to 25%, everything on _sfxSuspendGain (breathing,
-// heartbeat, engine drone, RWR lock tone/approach ping — every gameplay sfx
-// one-shot too) goes silent. A flat 200ms linear ramp either direction, so
-// nothing lingers audibly the instant the game loop freezes.
+// PAUSE/PANIC duck (see setMusicForState('PAUSED')): whatever's currently
+// playing drops to 25%, not silence — a flat 200ms linear ramp either
+// direction so nothing lingers audibly the instant the game loop freezes.
+// Gameplay sfx (breathing/heartbeat/engine/RWR tones) gets a separate,
+// harsher cut to true silence instead — see setSuspended().
 const PAUSE_MUSIC_DUCK_GAIN = 0.25;
 const PAUSE_RAMP_SECONDS = 0.2;
 
@@ -45,11 +51,28 @@ const VOICE_PROFILES = {
 
 // Breathing/heartbeat tied to the fear meter, threat/radio one-shots (RWR
 // lock tone, whoosh, impact thud, radio blip) synthesized with the Web
-// Audio API, plus real per-country music playback (musicManager.js).
+// Audio API, plus real per-country/menu music playback (musicManager.js).
 export class FearAudio {
   constructor() {
-    this.ctx = null;
-    this._started = false;
+    // Built immediately, not deferred to a user gesture — a fresh
+    // AudioContext starts 'suspended' under browser autoplay policy
+    // regardless (see resume()), but decoding buffers and scheduling
+    // sources on a suspended context works fine; only actually producing
+    // sound needs the gesture. Building the whole graph up front (instead
+    // of the old lazy "resume() builds everything" pattern) is what makes a
+    // single setMusicForState() call — even the very first one, at page
+    // load, before any interaction — always immediately correct: there's no
+    // separate "pending" bookkeeping to reconcile once a gesture finally
+    // arrives.
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new Ctx();
+    this._buildNoiseBuffer();
+    this._buildMasterBus();
+    this._buildBreathing();
+    this._buildHeartbeatBus();
+    this._buildFighterEngine();
+    this._buildMusicBus();
+
     this._heartbeatTimer = 0;
 
     this._lockActive = false;
@@ -67,50 +90,15 @@ export class FearAudio {
     // hold a continuous tone while a fighter is nearby in any state.
     this._engineActive = false;
 
-    // Music (see musicManager.js / setMusicCountry / preloadMusicCountry).
-    // AudioContext (and therefore MusicManager, which needs it to decode
-    // audio) doesn't exist until resume() — setMusicCountry()/
-    // preloadMusicCountry() called before that just queue up here and are
-    // replayed once resume() actually builds everything. This mirrors the
-    // browser's autoplay policy: nothing loads or plays before the player's
-    // first click/keypress triggers resume().
-    this._music = null;
-    this._pendingMusicCountry = null;
-    this._pendingPreloadKey = null;
-
-    // Stage 7B settings (master/music/sfx volume) — see setVolumes().
-    this._pendingVolumes = null;
+    // Last state passed to setMusicForState() — purely for the
+    // "[music] <from> -> <to>" transition log; the actual current track key
+    // lives in _music's own _currentKey.
+    this._musicState = null;
   }
 
-  // AudioContext must be created/resumed from a user gesture; call this from
-  // a click handler.
+  // Only step still gated on a user gesture — the graph itself already
+  // exists (built in the constructor). Call from a click/keydown handler.
   resume() {
-    if (!this._started) {
-      this._started = true;
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      this.ctx = new Ctx();
-      this._buildNoiseBuffer();
-      this._buildMasterBus();
-      this._buildBreathing();
-      this._buildHeartbeatBus();
-      this._buildFighterEngine();
-      this._buildMusicBus();
-      if (this._pendingMusicCountry) {
-        const key = this._pendingMusicCountry;
-        this._pendingMusicCountry = null;
-        this.setMusicCountry(key);
-      }
-      if (this._pendingPreloadKey) {
-        const key = this._pendingPreloadKey;
-        this._pendingPreloadKey = null;
-        this.preloadMusicCountry(key);
-      }
-      if (this._pendingVolumes) {
-        const volumes = this._pendingVolumes;
-        this._pendingVolumes = null;
-        this.setVolumes(volumes);
-      }
-    }
     if (this.ctx.state === 'suspended') {
       const p = this.ctx.resume();
       if (p && p.catch) p.catch(() => {});
@@ -193,7 +181,7 @@ export class FearAudio {
     this._sfxGain.gain.value = 1;
     this._sfxGain.connect(this._masterGain);
 
-    // Pause/panic/menu mute point for every gameplay sfx source (breathing,
+    // Pause/panic mute point for every gameplay sfx source (breathing,
     // heartbeat, engine drone, RWR beeps, every one-shot) — sits in front of
     // _sfxGain so muting it never disturbs the user's own sfx-volume
     // setting. See setSuspended().
@@ -205,9 +193,9 @@ export class FearAudio {
   // Fear-reactive chain that MusicManager's real playback feeds into:
   // MusicManager -> _musicBus (mix point) -> _musicFilter ("muffle the
   // world" lowpass, see update()) -> _musicDuckGain (transient ducking —
-  // radio/cutscene, see setMusicDucked/setCutsceneDuck) -> _pauseDuckGain
-  // (pause/panic/menu duck, see setSuspended) -> _musicVolumeGain
-  // (persistent user music-volume setting, see setVolumes) -> _masterGain.
+  // radio call, see setMusicDucked) -> _pauseDuckGain (pause/panic duck, see
+  // setMusicForState) -> _musicVolumeGain (persistent user music-volume
+  // setting, see setVolumes) -> _masterGain.
   _buildMusicBus() {
     const ctx = this.ctx;
     this._musicBus = ctx.createGain();
@@ -235,70 +223,80 @@ export class FearAudio {
     this._music = new MusicManager(ctx, this._musicBus);
   }
 
-  // Country transition (route.js's _applyWave, on every wave change):
-  // crossfades into `key`'s real track (musicManager.js). Safe to call
-  // before the AudioContext exists (the very first wave applies before the
-  // player's first click) — remembered in _pendingMusicCountry and applied
-  // once resume() actually builds everything, same deferral the browser's
-  // autoplay policy already requires of us.
-  setMusicCountry(key) {
-    if (!this._started) {
-      this._pendingMusicCountry = key;
-      return;
+  // Single source of truth for "which one track is audible, and how loud" —
+  // main.js calls this at every game-state transition instead of each one
+  // separately owning a slice of duck/gate/stop logic.
+  //
+  //   MENU     — SPLASH/MENU/CREDITS: the menu track, full volume.
+  //   FLYING   — `country`'s track (required), full volume.
+  //   PAUSED   — PAUSE/PANIC: whatever's already playing, ducked to 25%,
+  //              nothing new started (`country` ignored).
+  //   CUTSCENE — CUTSCENE/FINALE VIDEO: silence — the clip carries its own
+  //              audio (`country` ignored).
+  //
+  // Every call logs "[music] <from> -> <to>"; MusicManager.update() carries
+  // the companion assertion that catches more than one track ever actually
+  // being audible at once.
+  setMusicForState(musicState, country = null) {
+    let targetKey;
+    switch (musicState) {
+      case 'MENU':
+        targetKey = 'menu';
+        break;
+      case 'FLYING':
+        targetKey = country;
+        break;
+      case 'PAUSED':
+        targetKey = undefined; // don't touch the track, only the duck below
+        break;
+      case 'CUTSCENE':
+        targetKey = null; // silence
+        break;
+      default:
+        console.warn(`[music] setMusicForState: unknown state "${musicState}" — ignored`);
+        return;
     }
-    this._music.setCountry(key);
+
+    console.log(`[music] ${this._musicState ?? '(none)'} -> ${musicState}`);
+    this._musicState = musicState;
+
+    const now = this.ctx.currentTime;
+    const duckTarget = musicState === 'PAUSED' ? PAUSE_MUSIC_DUCK_GAIN : 1;
+    this._pauseDuckGain.gain.cancelScheduledValues(now);
+    this._pauseDuckGain.gain.setValueAtTime(this._pauseDuckGain.gain.value, now);
+    this._pauseDuckGain.gain.linearRampToValueAtTime(duckTarget, now + PAUSE_RAMP_SECONDS);
+
+    if (targetKey !== undefined) this._music.setTrack(targetKey);
   }
 
   // route.js calls this with the NEXT wave's key as soon as the current one
   // starts, so the track is already decoded by the time the player gets
-  // there — no gap on the actual transition. Same pre-start deferral as
-  // setMusicCountry() if called before the player's first click.
+  // there — no gap on the actual transition. Never produces audible output
+  // by itself (see MusicManager.preload()), so it needs no state gating.
   preloadMusicCountry(key) {
-    if (!this._started) {
-      this._pendingPreloadKey = key;
-      return;
-    }
     this._music.preload(key);
   }
 
   // radio.js calls this from _startCall/_endCall — smoothly ducks/restores
   // the whole music bus by MUSIC_DUCK_GAIN while a call is up.
   setMusicDucked(active) {
-    if (!this._started) return;
     const now = this.ctx.currentTime;
     this._musicDuckGain.gain.setTargetAtTime(active ? MUSIC_DUCK_GAIN : 1, now, 0.15);
   }
 
-  // main.js calls this around every cutscenePlayer.playCutscene() — ducks the
-  // same bus setMusicDucked() uses. Shares the node rather than adding a
-  // second one: radio.update() never runs while a cutscene has the game loop
-  // suspended, so the two ducks can't actually fight over it in practice.
-  // `full` (the finale video only) ducks all the way to silence instead of
-  // CUTSCENE_DUCK_GAIN, since that clip's own audio needs to be heard clean.
-  setCutsceneDuck(active, { full = false } = {}) {
-    if (!this._started) return;
-    const now = this.ctx.currentTime;
-    const target = active ? (full ? 0 : CUTSCENE_DUCK_GAIN) : 1;
-    this._musicDuckGain.gain.setTargetAtTime(target, now, 0.15);
-  }
-
   // main.js calls this on every transition off/onto FLYING that isn't a
-  // cutscene (PAUSED, the panic screen, MENU) — separate node from
-  // _musicDuckGain/setCutsceneDuck so it can't clobber (or be clobbered by)
-  // an in-progress radio-call duck; the two multiply together instead.
-  // Silences _sfxSuspendGain outright (breathing, heartbeat, engine drone,
-  // RWR lock tone/approach ping, every one-shot) rather than just ducking it,
-  // since none of that should be audible at all once the game loop freezes.
+  // cutscene (PAUSED, the panic screen) — silences every gameplay sfx
+  // one-shot/drone outright (breathing, heartbeat, engine drone, RWR lock
+  // tone/approach ping) rather than just ducking it, since none of that
+  // should be audible at all once the game loop freezes. Music's own
+  // pause/panic duck lives in setMusicForState('PAUSED') instead — kept
+  // separate so this can't clobber (or be clobbered by) that call.
   setSuspended(active) {
-    if (!this._started) return;
     const now = this.ctx.currentTime;
-    const ramp = (param, target) => {
-      param.cancelScheduledValues(now);
-      param.setValueAtTime(param.value, now);
-      param.linearRampToValueAtTime(target, now + PAUSE_RAMP_SECONDS);
-    };
-    ramp(this._sfxSuspendGain.gain, active ? 0 : 1);
-    ramp(this._pauseDuckGain.gain, active ? PAUSE_MUSIC_DUCK_GAIN : 1);
+    const param = this._sfxSuspendGain.gain;
+    param.cancelScheduledValues(now);
+    param.setValueAtTime(param.value, now);
+    param.linearRampToValueAtTime(active ? 0 : 1, now + PAUSE_RAMP_SECONDS);
   }
 
   // route.js's calm-payoff -> landing sequence: a warm sustained chord layered
@@ -306,7 +304,6 @@ export class FearAudio {
   // a new music asset (no "final track" mp3 exists — see CLAUDE.md's "no huge
   // asset downloads" rule).
   playFinaleSwell() {
-    if (!this._started) return;
     const ctx = this.ctx;
     const now = ctx.currentTime;
     const root = 261.63; // C4
@@ -334,7 +331,6 @@ export class FearAudio {
   // Landing sequence: gear-down whir (bandpass noise sweep) ending in a
   // locked-down clunk.
   playGearDown() {
-    if (!this._started) return;
     const ctx = this.ctx;
     const now = ctx.currentTime;
     const duration = 1.1;
@@ -366,7 +362,6 @@ export class FearAudio {
 
   // Landing sequence: touchdown — a heavy low thump plus a short rumble.
   playTouchdownThud() {
-    if (!this._started) return;
     const ctx = this.ctx;
     const now = ctx.currentTime;
 
@@ -387,33 +382,19 @@ export class FearAudio {
     source.stop(now + 0.45);
   }
 
-  // Finale video handoff: fades the raw per-country music bus itself to
-  // silence (not just the duck node) — the video's own audio needs a clean
-  // stage, and unlike the duck this doesn't get restored until a fresh
-  // playthrough (see resetForReplay()).
-  stopMusic() {
-    if (!this._started) return;
-    this._musicBus.gain.setTargetAtTime(0, this.ctx.currentTime, 0.3);
-  }
-
-  // main.js calls this when returning to MENU after the credits — undoes
-  // stopMusic()/any lingering duck so a fresh playthrough's music works.
+  // main.js calls this at the top of every resetGameState() (fresh
+  // playthrough or returning to menu) — clears any radio-call duck that
+  // might have been left mid-ramp. setMusicForState()'s pause/panic duck
+  // needs no equivalent reset here: resetGameState() is always immediately
+  // followed by a setMusicForState() call (startNewGame()/resetToMenu()),
+  // which already re-levels it.
   resetForReplay() {
-    if (!this._started) return;
-    const now = this.ctx.currentTime;
-    this._musicBus.gain.setTargetAtTime(1, now, 0.05);
-    this._musicDuckGain.gain.setTargetAtTime(1, now, 0.05);
+    this._musicDuckGain.gain.setTargetAtTime(1, this.ctx.currentTime, 0.05);
   }
 
-  // menu.js's settings screen (Настройки). Deferred the same way
-  // setMusicCountry/preloadMusicCountry are if called before the
-  // AudioContext exists (main.js applies saved settings on load, before the
-  // player's first click). Any field left undefined is left unchanged.
+  // menu.js's settings screen (Настройки). Any field left undefined is left
+  // unchanged.
   setVolumes({ master, music, sfx } = {}) {
-    if (!this._started) {
-      this._pendingVolumes = { master, music, sfx }; // main.js always calls with all three set — last call wins
-      return;
-    }
     const now = this.ctx.currentTime;
     if (master != null) this._masterGain.gain.setTargetAtTime(master, now, 0.05);
     if (music != null) this._musicVolumeGain.gain.setTargetAtTime(music, now, 0.05);
@@ -476,7 +457,7 @@ export class FearAudio {
   }
 
   updateLockTone(progress, pan = 0) {
-    if (!this._started || !this._lockActive) return;
+    if (!this._lockActive) return;
     this._lockProgress = progress;
     this._lockPan = pan;
   }
@@ -496,7 +477,7 @@ export class FearAudio {
   }
 
   updateApproachPing(pan, proximity) {
-    if (!this._started || !this._approachActive) return;
+    if (!this._approachActive) return;
     this._approachPan = pan;
     this._approachProximity = proximity;
   }
@@ -513,7 +494,7 @@ export class FearAudio {
   }
 
   updateFighterEngine(pan, proximity) {
-    if (!this._started || !this._engineActive) return;
+    if (!this._engineActive) return;
     const now = this.ctx.currentTime;
     const clampedProximity = Math.max(0, Math.min(1, proximity));
     const gain = 0.06 + 0.22 * clampedProximity;
@@ -525,7 +506,6 @@ export class FearAudio {
 
   stopFighterEngine() {
     this._engineActive = false;
-    if (!this._started) return;
     this._engineGain.gain.setTargetAtTime(0, this.ctx.currentTime, 0.2);
   }
 
@@ -534,7 +514,6 @@ export class FearAudio {
   // dodge window vs. a fighter lining up on your six) don't get confused for
   // each other by ear.
   playFighterLineupCue(pan = 0) {
-    if (!this._started) return;
     const ctx = this.ctx;
     const now = ctx.currentTime;
     const clicks = 6;
@@ -566,7 +545,6 @@ export class FearAudio {
   // static. One call per ATTACK burst (threats.js fires it once, at the
   // moment the burst phase begins).
   playGunBurst(pan = 0) {
-    if (!this._started) return;
     const ctx = this.ctx;
     const start = ctx.currentTime;
     const rounds = 8;
@@ -603,7 +581,6 @@ export class FearAudio {
   // approach ping (flat 700Hz blips) so it reads as its own distinct cue —
   // "the break is coming," not just another beep in the same family.
   playDodgeCue() {
-    if (!this._started) return;
     const ctx = this.ctx;
     const now = ctx.currentTime;
     const duration = 0.35;
@@ -625,7 +602,6 @@ export class FearAudio {
   }
 
   playWhoosh() {
-    if (!this._started) return;
     const ctx = this.ctx;
     const now = ctx.currentTime;
     const duration = 0.4;
@@ -652,7 +628,6 @@ export class FearAudio {
   }
 
   playImpactThud() {
-    if (!this._started) return;
     this._playThump(this._sfxSuspendGain, 90, 35, 0.35);
   }
 
@@ -660,7 +635,6 @@ export class FearAudio {
   // a successful dodge — the whoosh is the physical sound (air), this is the
   // emotional payoff.
   playDodgeSting() {
-    if (!this._started) return;
     const ctx = this.ctx;
     const now = ctx.currentTime;
     const root = 523.25; // C5
@@ -687,7 +661,6 @@ export class FearAudio {
   }
 
   playRadioBlip() {
-    if (!this._started) return;
     const ctx = this.ctx;
     const start = ctx.currentTime;
     const blips = 4 + Math.floor(Math.random() * 3);
@@ -721,7 +694,6 @@ export class FearAudio {
   // field) selects VOICE_PROFILES so Bagdat and the NATO pilot read as
   // distinct characters, not the same blip replayed.
   playVoiceLine(speaker, textLength) {
-    if (!this._started) return;
     const profile = VOICE_PROFILES[speaker] || VOICE_PROFILES.bagdat;
     const ctx = this.ctx;
     const now = ctx.currentTime;
@@ -795,11 +767,21 @@ export class FearAudio {
     source.stop(time + duration + 0.02);
   }
 
-  update(dt, fear) {
-    if (!this._started) return;
-    const now = this.ctx.currentTime;
+  // Called every frame regardless of game state (main.js's render loop calls
+  // this unconditionally, outside the FLYING/MENU branches) — voice pruning
+  // and the stacked-voice assertion can't wait for FLYING: a MENU/CUTSCENE
+  // crossfade's old voice needs pruning (and the assertion needs to actually
+  // run) even while just sitting at the menu, which the game can do
+  // indefinitely.
+  updateMusic() {
+    this._music.update(this.ctx.currentTime);
+  }
 
-    this._music.update(now);
+  // FLYING-only fear-reactive layer (muffle filter, breathing, heartbeat,
+  // RWR lock/approach tones). Music's own per-frame update is separate — see
+  // updateMusic() above, called unconditionally regardless of state.
+  update(dt, fear) {
+    const now = this.ctx.currentTime;
 
     // 60+: "the world" (music) muffles under a closing lowpass — the
     // lock-tone/approach-ping/heartbeat deliberately stay untouched, since

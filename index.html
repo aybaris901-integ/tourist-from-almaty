@@ -11,11 +11,14 @@
     rel="stylesheet"
   />
   <link rel="stylesheet" href="/src/style.css" />
-  <!-- Main-menu background music (see src/menuMusic.js) — gives the browser
-       a head start on the fetch alongside the module-level `new Audio()` /
-       `load()` call, so the request is already in flight before any JS
-       has even had a chance to run. -->
-  <link rel="preload" href="/audio/music/background.mp3" as="audio" />
+  <!-- Menu music: fetched via musicManager.js's fetch()+decodeAudioData()
+       (see main.js's setMusicForState('MENU'), called at module-load time),
+       not a plain <audio> element — as="fetch" (+ crossorigin) matches that
+       request type so the browser actually reuses this preload instead of
+       double-fetching; as="audio" only gets reused by a real <audio>/<video>
+       element request. Gives the browser a head start alongside the HTML
+       parse, before any JS (including the module script) has run. -->
+  <link rel="preload" href="/audio/music/background.mp3" as="fetch" crossorigin />
 </head>
 <body>
   <div id="app">
@@ -37,6 +40,11 @@
           <div id="menu-wordmark">Tourist From Almaty</div>
           <div id="menu-tagline">3D Arcade Flight &middot; ALA &rarr; IST</div>
         </div>
+        <div id="splash-bottle" aria-hidden="true">
+          <div id="splash-bottle-neck"></div>
+          <div id="splash-bottle-body"></div>
+        </div>
+        <div id="splash-prompt">Press To Start</div>
         <div id="menu-rule"></div>
         <div id="menu-screens"></div>
         <div id="menu-status-strip">LEGS 05 &middot; DISTANCE 4320 KM &middot; WEAPONS NONE &middot; DUTY-FREE 1 BOTTLE</div>

@@ -127,7 +127,7 @@ export const CONFIG = {
   // burst) -> COOLDOWN (breaks away) -> back to PATROL. (per-wave: count,
   // fighterCanAttack, attack interval, accuracy — see route.js's WAVES;
   // PATROL-only until a wave sets fighterCanAttack.)
-  FIGHTER_MODEL_URL: '/models/fighter.glb',
+  FIGHTER_MODEL_URL: `${import.meta.env.BASE_URL}models/fighter.glb`,
   // This particular export is ~900 world units long (Sketchfab FBX scale
   // artifact) — the file's native scale is never trusted. On load the
   // bounding box's longest dimension is measured and the whole model

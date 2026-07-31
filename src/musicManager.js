@@ -1,23 +1,32 @@
-// Real per-country music playback, replacing the old synthesized loops.
-// Owns loading/decoding/caching, crossfading between tracks, and seamless
-// looping — nothing here knows about fear/ducking/muffling; it just plays
-// into whatever destination node it's given (audio.js connects that
-// destination into its existing fear-reactive chain, so ducking/muffling
-// keep working unchanged on top of these real tracks).
-const CROSSFADE_SECONDS = 1.5; // "~1-2 seconds" per spec
+// Real per-track music playback (menu + every per-country track), replacing
+// the old synthesized loops. Owns loading/decoding/caching, crossfading
+// between tracks, and seamless looping — nothing here knows about game
+// state (menu vs flying vs cutscene); it just plays whatever key it's told
+// into whatever destination node it's given. audio.js's setMusicForState()
+// is the single place that decides which key that should be at any moment.
+const CROSSFADE_SECONDS = 0.8; // spec: "crossfade 800ms (fade out old, fade in new)"
 
-// route.js's WAVES musicKey -> file under /public/audio/music/. Istanbul
-// reuses Turkey's key directly in WAVES (see route.js) rather than having a
-// second entry here pointing at the same file. Menu music is a separate,
-// plain <audio> element (see menuMusic.js) — it doesn't need this system's
-// AudioContext-gated crossfade/ducking, and gating it here is what caused
-// the menu track to not even start loading until the AudioContext unlocked.
+// audio.js's setMusicForState() key -> file under /public/audio/music/.
+// 'menu' used to be its own separate plain <audio> element (menuMusic.js) so
+// it could start loading/attempting playback before the AudioContext
+// existed — now the context is built eagerly at FearAudio construction (see
+// audio.js), so decoding it here works exactly like any country track, and
+// "exactly one track ever audible" becomes a property of this one class
+// rather than something two separate systems both have to promise. Istanbul
+// reuses Turkey's key directly in WAVES (route.js) rather than having a
+// second entry here pointing at the same file.
 const TRACKS = {
-  kazakhstan: '/audio/music/kazakhstan.mp3',
-  azerbaijan: '/audio/music/azerbaijan.mp3',
-  georgia: '/audio/music/georgia.mp3',
-  turkey: '/audio/music/turkey.mp3',
+  menu: `${import.meta.env.BASE_URL}audio/music/background.mp3`,
+  kazakhstan: `${import.meta.env.BASE_URL}audio/music/kazakhstan.mp3`,
+  azerbaijan: `${import.meta.env.BASE_URL}audio/music/azerbaijan.mp3`,
+  georgia: `${import.meta.env.BASE_URL}audio/music/georgia.mp3`,
+  turkey: `${import.meta.env.BASE_URL}audio/music/turkey.mp3`,
 };
+
+// Above this gain, a voice counts as "audible" for the stacked-voice
+// assertion in update() — comfortably below where a crossfade spends most of
+// its time, comfortably above true silence/rounding noise.
+const AUDIBLE_GAIN_THRESHOLD = 0.02;
 
 export class MusicManager {
   constructor(ctx, destination) {
@@ -33,20 +42,29 @@ export class MusicManager {
 
     this._currentKey = null;
     this._voices = []; // { source, gain, stopAt: number|null } — usually one, briefly two mid-crossfade
+
+    // Monotonic call counter — see setTrack()'s race guard. Needed because
+    // `this._currentKey !== key` alone doesn't catch a key cycling back to
+    // its own value (menu -> flying -> menu) while an earlier call for that
+    // same key is still awaiting its (shared, memoized) decode: both calls
+    // would see _currentKey === key once it resolves and both would start a
+    // voice, stacking two "current" loops for the same track — the exact
+    // "duplicate loops after several restarts" risk this guards against.
+    this._callToken = 0;
   }
 
   // Fetch+decode a track, memoized — including failures (cached as `null`),
   // so a missing/broken file only ever logs once and never gets re-fetched
-  // just because both preload() and a later setCountry() touch the same
-  // key. Never throws — a failed load resolves to null so callers can fall
-  // back to silence instead of crashing.
+  // just because both preload() and a later setTrack() touch the same key.
+  // Never throws — a failed load resolves to null so callers can fall back
+  // to silence instead of crashing.
   _load(key) {
     if (this._buffers.has(key)) return Promise.resolve(this._buffers.get(key));
     if (this._loadPromises.has(key)) return this._loadPromises.get(key);
 
     const url = TRACKS[key];
     if (!url) {
-      console.error(`[music] no track mapped for country key "${key}"`);
+      console.error(`[music] no track mapped for key "${key}"`);
       this._buffers.set(key, null);
       return Promise.resolve(null);
     }
@@ -75,18 +93,21 @@ export class MusicManager {
   // Kick off a load without switching to it — route.js calls this with the
   // NEXT wave's key as soon as the current one starts, so by the time the
   // player actually reaches that country the track is already decoded and
-  // setCountry() resolves instantly (no gap).
+  // setTrack() resolves instantly (no gap).
   preload(key) {
     if (key) this._load(key);
   }
 
   // Crossfades CROSSFADE_SECONDS from whatever's currently playing into
-  // `key`'s track. Fire-and-forget (async internally to await decoding) —
-  // if `key` changes again before the load resolves, the stale result is
-  // discarded rather than clobbering whatever's actually current by then.
-  async setCountry(key) {
+  // `key`'s track — `key === null` just fades everything out to silence
+  // (CUTSCENE/FINALE VIDEO: the clip carries its own audio). Fire-and-forget
+  // (async internally to await decoding) — see _callToken for why a stale
+  // call has to check more than just "is my key still current".
+  async setTrack(key) {
     if (this._currentKey === key) return;
     this._currentKey = key;
+    this._callToken += 1;
+    const myToken = this._callToken;
 
     const now0 = this.ctx.currentTime;
     for (const voice of this._voices) {
@@ -97,9 +118,11 @@ export class MusicManager {
       voice.stopAt = now0 + CROSSFADE_SECONDS + 0.1;
     }
 
+    if (key === null) return; // silence — nothing new to start
+
     const buffer = await this._load(key);
-    if (this._currentKey !== key) return; // superseded while awaiting the load
-    if (!buffer) return; // load failed — already logged in _load; stay silent
+    if (this._callToken !== myToken) return; // a newer setTrack() call (any key) superseded this one while awaiting
+    if (!buffer) return; // load failed — already logged in _load, stay silent
 
     const now = this.ctx.currentTime;
     const source = this.ctx.createBufferSource();
@@ -121,9 +144,14 @@ export class MusicManager {
     this._voices.push({ source, gain, stopAt: null });
   }
 
-  // Called every frame (audio.js's update()) — stops and drops voices whose
-  // crossfade-out has finished. No per-frame scheduling needed otherwise;
-  // real buffers just play/loop natively once started.
+  // Called every frame, in every game state (audio.js's updateMusic(), called
+  // unconditionally from main.js's render loop). Prunes voices whose
+  // crossfade-out has finished, then asserts the actual invariant this class
+  // exists to guarantee: at most one voice may be "current" (no scheduled
+  // stop) at a time. More than one means two loops are both headed for/at
+  // full volume — audible doubling, the exact class of bug a single
+  // crossfade primitive (replacing the old separate menu-audio-element +
+  // ad-hoc duck/gate flags) is supposed to make structurally impossible.
   update(now) {
     this._voices = this._voices.filter((voice) => {
       if (voice.stopAt !== null && now >= voice.stopAt) {
@@ -136,5 +164,15 @@ export class MusicManager {
       }
       return true;
     });
+
+    let audibleTargets = 0;
+    for (const voice of this._voices) {
+      if (voice.stopAt === null && voice.gain.gain.value > AUDIBLE_GAIN_THRESHOLD) audibleTargets++;
+    }
+    if (audibleTargets > 1) {
+      console.warn(
+        `[music] ASSERTION FAILED — ${audibleTargets} music voices are simultaneously "current" (expected at most 1). currentKey="${this._currentKey}"`
+      );
+    }
   }
 }

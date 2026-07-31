@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { CONFIG as FEAR_CONFIG } from './fear.js';
 import { smoothDamp, randRange, TOON_GRADIENT } from './utils.js';
 
-const MODEL_URL = '/models/cockpit.glb';
+const MODEL_URL = `${import.meta.env.BASE_URL}models/cockpit.glb`;
 
 // Final fit for cockpit.glb, found by live-tuning against the (now removed)
 // debug overlay and tuning keys. Fixed — do not recompute from the bbox.

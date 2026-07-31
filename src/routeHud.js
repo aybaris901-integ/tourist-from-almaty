@@ -1,6 +1,6 @@
 import { WAVES } from './route.js';
 
-const KOLONYA_URL = '/img/kolonya.png';
+const KOLONYA_URL = `${import.meta.env.BASE_URL}img/kolonya.png`;
 
 // WAVES[i].country is flavor text for the big transition card ("Turkey —
 // Inland", "Istanbul Approach") — too long for a compact status line, so the

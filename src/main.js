@@ -7,7 +7,6 @@ import { RouteHud } from './routeHud.js';
 import { Fear } from './fear.js';
 import { PostFX } from './postfx.js';
 import { FearAudio } from './audio.js';
-import { playMenuMusic, pauseMenuMusic, setMenuMusicVolume } from './menuMusic.js';
 import { Threats } from './threats.js';
 import { Radio } from './radio.js';
 import { Route, WAVES } from './route.js';
@@ -19,8 +18,8 @@ import { MenuUI, stripFlatBackground } from './menu.js';
 import { loadProgress, saveProgress } from './progress.js';
 import { loadSettings, saveSettings } from './settings.js';
 
-const MENU_VIDEO_URL = '/video/menu.mp4'; // config path — swap here if it ever moves
-const MENU_LOGO_URL = '/img/logo.png';
+const MENU_VIDEO_URL = `${import.meta.env.BASE_URL}video/menu.mp4`; // config path — swap here if it ever moves
+const MENU_LOGO_URL = `${import.meta.env.BASE_URL}img/logo.png`;
 
 const sceneCanvas = document.getElementById('scene');
 const hudCanvas = document.getElementById('hud');
@@ -82,13 +81,10 @@ function applySettings() {
   FlightConfig.INVERT_ROLL = settings.invertRoll;
   FlightConfig.INVERT_PITCH = settings.invertPitch;
   FlightConfig.MOUSE_SENSITIVITY = DEFAULT_MOUSE_SENSITIVITY * settings.mouseSensitivity;
-  // audio.setVolumes() defers internally (via _pendingVolumes) until
-  // resume() actually builds the audio graph, same as setMusicCountry().
+  // Menu and country tracks now share the same _musicVolumeGain (see
+  // audio.js/musicManager.js) — one call scales both, no separate menu-only
+  // volume path needed anymore.
   audio.setVolumes({ master: settings.masterVolume, music: settings.musicVolume, sfx: settings.sfxVolume });
-  // menuMusic.js has no separate master/music gain stages (just one
-  // <audio> element) — combine the two sliders the same way they'd
-  // multiply together in audio.js's graph.
-  setMenuMusicVolume(settings.masterVolume * settings.musicVolume);
 }
 applySettings();
 
@@ -179,13 +175,12 @@ function buildSettingsItems(menuInstance) {
 async function watchIntroFromMenu() {
   hideMenuShell();
   setState('CUTSCENE');
-  audio.setCutsceneDuck(true);
+  audio.setMusicForState('CUTSCENE');
   for (const id of INTRO_SEQUENCE) {
     await cutscenePlayer.replayCutscene(id);
   }
-  audio.setCutsceneDuck(false);
   setState('MENU');
-  showMenuShell();
+  showMenuShell(); // its own setMusicForState('MENU') call resumes the menu track
 }
 
 function buildControlsItems(menuInstance) {
@@ -286,22 +281,78 @@ stripFlatBackground(MENU_LOGO_URL)
   })
   .catch(() => {});
 
+// --- First-load splash ------------------------------------------------------
+// Audio can't produce sound before the page has seen a user gesture
+// (browser policy) — rather than fight that, the very first showMenuShell()
+// call shows a "Press To Start" title card over the menu instead of the
+// button list, so there's an obvious, intentional thing to click. The menu
+// track is already scheduled underneath (showMenuShell()'s own
+// setMusicForState('MENU') call — see audio.js's constructor for why that's
+// safe to schedule before any gesture exists) and becomes audible the
+// instant dismissSplash() below calls audio.resume(). Flips once and never
+// shows again this session (matches resetToMenu()'s reuse of showMenuShell()
+// for every later menu visit).
+let splashDismissed = false;
+
+// video/menu.mp4 is muted+autoplay so it can play with zero gesture; if it
+// happens to carry its own audio track, this is what turns it on once a
+// gesture finally exists. mozHasAudio/webkitAudioDecodedByteCount/audioTracks
+// are the three vendor-specific ways to ask "does this element have audio"
+// (no single standard property) — checked defensively since none of them
+// exist on every browser.
+function menuVideoHasAudioTrack() {
+  return Boolean(
+    menuVideoEl.mozHasAudio ||
+      menuVideoEl.webkitAudioDecodedByteCount ||
+      (menuVideoEl.audioTracks && menuVideoEl.audioTracks.length)
+  );
+}
+
+function dismissSplash() {
+  window.removeEventListener('pointerdown', dismissSplash);
+  window.removeEventListener('keydown', dismissSplash);
+  splashDismissed = true;
+  menuShellEl.classList.remove('splash-active');
+  audio.resume();
+  if (menuVideoHasAudioTrack()) menuVideoEl.muted = false;
+  mainMenu.open('main', buildMainMenuItems);
+}
+
 function showMenuShell() {
   menuShellEl.classList.remove('hidden');
   playMenuVideo();
-  // menuMusic.js already started loading this at import time — this just
-  // (re)starts/reuses the same persistent <audio> instance. If autoplay is
-  // blocked (no user gesture yet), it retries itself on the page's first
-  // pointerdown/keydown.
-  playMenuMusic();
-  mainMenu.open('main', buildMainMenuItems);
+  // SPLASH/MENU/CREDITS all route to the same 'MENU' music state — this
+  // covers every showMenuShell() call (page load, resetToMenu(),
+  // watchIntroFromMenu()'s return) with the one call, no separate
+  // menu-only autoplay/gesture-retry mechanism needed anymore (the
+  // AudioContext exists immediately — see audio.js's constructor — so this
+  // just schedules the crossfade; it becomes audible the moment resume()
+  // actually runs, whenever that ends up being).
+  audio.setMusicForState('MENU');
+  if (splashDismissed) {
+    mainMenu.open('main', buildMainMenuItems);
+  } else {
+    // Deliberately doesn't call mainMenu.open() yet — MenuUI.open() attaches
+    // its own window keydown listener immediately, and the dismiss gesture
+    // below is itself a window keydown listener; opening the menu now would
+    // let the very same keypress that dismisses the splash also land on a
+    // focused menu item underneath (e.g. an Enter that's meant to say
+    // "start" instead firing whatever's focused). Deferring open() until
+    // dismissSplash() runs keeps the two listeners from ever overlapping.
+    menuShellEl.classList.add('splash-active');
+    window.addEventListener('pointerdown', dismissSplash);
+    window.addEventListener('keydown', dismissSplash);
+  }
 }
 
 function hideMenuShell() {
   mainMenu.close();
   menuShellEl.classList.add('hidden');
   pauseMenuVideo();
-  pauseMenuMusic();
+  // No music call here — whatever calls hideMenuShell() always immediately
+  // follows up with its own setMusicForState() for the state it's entering
+  // (startNewGame() -> eventually enterFlying(); watchIntroFromMenu() ->
+  // 'CUTSCENE').
 }
 
 // --- Credits ---------------------------------------------------------------
@@ -364,6 +415,7 @@ function enterFlying() {
   fear.frozen = false;
   hint.classList.add('hidden');
   audio.setSuspended(false);
+  audio.setMusicForState('FLYING', WAVES[route.waveIndex].musicKey);
 }
 
 function canPause() {
@@ -373,6 +425,7 @@ function canPause() {
 function openPause() {
   setState('PAUSED');
   audio.setSuspended(true);
+  audio.setMusicForState('PAUSED');
   pauseOverlayEl.classList.remove('hidden');
   pauseMenu.onEscapeAtRoot = () => resumeFromPause();
   pauseMenu.open('main', buildPauseMainItems);
@@ -383,41 +436,51 @@ function resumeFromPause() {
   pauseOverlayEl.classList.add('hidden');
   setState('FLYING'); // reacquires pointer lock itself
   audio.setSuspended(false);
+  audio.setMusicForState('FLYING', WAVES[route.waveIndex].musicKey);
 }
 
-// Suspends the loop, ducks music, plays `id`, then restores whatever state
-// was active before (always 'FLYING' in practice — wave-complete/finale
-// cutscenes only ever fire from inside the FLYING branch below). `replay`
-// bypasses cutscenePlayer's play-once guard (window.tfaDebug.replayCutscene).
+// main.js's single map from a top-level `state` value back to the music
+// state it implies — used wherever a cutscene needs to resume into whatever
+// was playing before it (gatedCutscene() below covers both 'FLYING' in
+// practice and, via window.tfaDebug.playCutscene/replayCutscene, 'MENU'/
+// 'PAUSED' too, since that debug path "works from ANY state").
+function musicForGameState(s) {
+  if (s === 'FLYING') return audio.setMusicForState('FLYING', WAVES[route.waveIndex].musicKey);
+  if (s === 'PAUSED') return audio.setMusicForState('PAUSED');
+  return audio.setMusicForState('MENU');
+}
+
+// Suspends the loop, stops all music (CUTSCENE: the clip carries its own
+// audio), plays `id`, then restores whatever state was active before
+// (always 'FLYING' in practice — wave-complete/finale cutscenes only ever
+// fire from inside the FLYING branch below). `replay` bypasses
+// cutscenePlayer's play-once guard (window.tfaDebug.replayCutscene).
 function gatedCutscene(id, { replay = false } = {}) {
   const prevState = state;
   setState('CUTSCENE');
-  audio.setCutsceneDuck(true);
+  audio.setMusicForState('CUTSCENE');
   const promise = replay ? cutscenePlayer.replayCutscene(id) : cutscenePlayer.playCutscene(id);
   return promise.then(() => {
-    audio.setCutsceneDuck(false);
     setState(prevState); // reacquires pointer lock itself if prevState was 'FLYING'
+    musicForGameState(prevState);
   });
 }
 
 // Stage 7A finale, part 3: crossfade to black over the last landed frame,
 // then hand off to the existing finale_offering clip — unlike every other
 // cutscene, this one's own audio matters (see cutscenes.js's `unmuted`), so
-// the game music is fully silenced (not just ducked) before it starts.
-// Bypasses gatedCutscene() (used for every other cutscene) since this needs
-// that different duck behavior and doesn't return to FLYING afterward —
-// credits, then MENU, instead.
+// music is fully stopped (CUTSCENE/FINALE VIDEO rule) rather than resumed
+// afterward — credits reads as MENU (see the state table), then MENU itself.
 async function runFinaleSequence() {
   finaleFade.style.opacity = '1';
   await new Promise((resolve) => setTimeout(resolve, 1000));
 
   setState('CUTSCENE');
-  audio.setCutsceneDuck(true, { full: true });
-  audio.stopMusic();
+  audio.setMusicForState('CUTSCENE');
   await cutscenePlayer.playCutscene(FINALE_CUTSCENE_ID);
-  audio.setCutsceneDuck(false);
 
   finaleFade.style.opacity = '0';
+  audio.setMusicForState('MENU'); // credits scroll reads as MENU, not silence
   showCredits(resetToMenu);
 }
 
@@ -450,6 +513,10 @@ function resetGameState(waveIndex) {
 // play-once guards are permanent for the session/forever, matching the
 // existing reload behavior documented in runIntroThenFly()).
 function resetToMenu() {
+  // resetGameState() below constructs a placeholder Route (see its own
+  // comment) — that no longer touches music at all (see route.js's
+  // _applyWave()), so no gating is needed here; showMenuShell() is what
+  // actually puts the menu track back on.
   resetGameState(0);
   fear.frozen = true;
   setState('MENU');
@@ -465,6 +532,9 @@ function resetToMenu() {
 // regardless of the seen-flag, and clears it first. "Продолжить" and every
 // other country-select entry leave it false and respect the seen-flag.
 function startNewGame(waveIndex, { forceIntro = false } = {}) {
+  // The new wave's country track only actually starts once runIntroThenFly()
+  // below reaches enterFlying() (or, for a forceIntro start, once the intro
+  // cutscene finishes) — see enterFlying()'s own setMusicForState('FLYING').
   resetGameState(waveIndex);
   hideMenuShell();
   audio.resume();
@@ -516,12 +586,11 @@ async function runIntroThenFly(forceIntro = false) {
 
   setState('CUTSCENE');
   hint.classList.add('hidden');
-  audio.setCutsceneDuck(true);
+  audio.setMusicForState('CUTSCENE');
   for (const id of INTRO_SEQUENCE) {
     await cutscenePlayer.playCutscene(id);
   }
-  audio.setCutsceneDuck(false);
-  enterFlying();
+  enterFlying(); // its own setMusicForState('FLYING', ...) call starts wave 0's track
   // Match cut into gameplay is the premise here — no fade, no menu flash.
   // Pointer lock can be lost mid-clip (e.g. Escape); reclaim it silently.
   // Browsers may refuse without a fresh user gesture (the original click's
@@ -637,6 +706,13 @@ let landingStarted = false; // edge-detects route.phase reaching 'landing', to c
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
 
+  // Every frame, regardless of state — prunes finished crossfade voices and
+  // runs the stacked-voice assertion (see audio.js/musicManager.js). Can't
+  // live inside the FLYING branch below: the game can sit at MENU/CUTSCENE
+  // indefinitely, and a crossfade started from there still needs its old
+  // voice pruned instead of silently accumulating forever.
+  audio.updateMusic();
+
   if (state === 'FLYING') {
     // threats.timeScale dips briefly on a clean dodge (satisfying slow-mo);
     // gameplay motion uses gameDt, scheduling/fear/UI/audio stay on real dt.
@@ -657,6 +733,7 @@ renderer.setAnimationLoop(() => {
       if (inPanicScreen) {
         if (document.pointerLockElement === sceneCanvas) document.exitPointerLock();
         audio.setSuspended(true);
+        audio.setMusicForState('PAUSED'); // PANIC ducks to 25%, same as PAUSE — see audio.js
         panicOverlayEl.classList.remove('hidden');
         panicMenu.onEscapeAtRoot = () => exitPanicToMenu();
         panicMenu.open('main', buildPanicItems);
@@ -667,6 +744,7 @@ renderer.setAnimationLoop(() => {
         panicMenu.close();
         panicOverlayEl.classList.add('hidden');
         audio.setSuspended(false);
+        audio.setMusicForState('FLYING', WAVES[route.waveIndex].musicKey);
         const req = sceneCanvas.requestPointerLock();
         if (req && req.catch) req.catch(() => {});
       }

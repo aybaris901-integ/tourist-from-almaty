@@ -207,6 +207,82 @@ html, body {
   margin-bottom: 26px;
 }
 
+/* First-load gate (main.js's splash-before-the-menu) — logo/wordmark/tagline
+   above (already in #menu-title) stay exactly as they are; this just adds
+   the signature yellow bottle + a pulsing prompt in their place, and hides
+   the button rule/list/status-strip underneath so the very first frame reads
+   as a title card, not a menu with nothing to click yet. display:none (not
+   opacity) so the collapsed state costs zero layout height — the ordinary
+   post-dismiss menu keeps the exact vertical rhythm it already had before
+   this existed. main.js toggles #menu-shell's .splash-active and swaps
+   which side of this is shown; there is no animated crossfade between the
+   two states, matching every other instant show/hide in this menu (see
+   #menu-shell.hidden itself). */
+#splash-bottle {
+  display: none;
+  position: relative;
+  width: 14px;
+  height: 22px;
+  margin: 0 auto 14px;
+}
+
+#menu-shell.splash-active #splash-bottle {
+  display: block;
+}
+
+#splash-bottle-neck {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  transform: translateX(-50%);
+  width: 5px;
+  height: 7px;
+  background: #f5c518;
+}
+
+#splash-bottle-body {
+  position: absolute;
+  left: 50%;
+  top: 6px;
+  transform: translateX(-50%);
+  width: 12px;
+  height: 16px;
+  border-radius: 2px;
+  background: #f5c518;
+  box-shadow: 0 0 8px rgba(245, 197, 24, 0.5);
+}
+
+#splash-prompt {
+  display: none;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: #f5c518;
+  text-align: center;
+  margin-bottom: 26px;
+  animation: splashPromptPulse 1.6s ease-in-out infinite;
+}
+
+#menu-shell.splash-active #splash-prompt {
+  display: block;
+}
+
+@keyframes splashPromptPulse {
+  0%, 100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+#menu-shell.splash-active #menu-rule,
+#menu-shell.splash-active #menu-status-strip {
+  display: none;
+}
+
 #menu-status-strip {
   font-family: var(--font-mono);
   font-size: 11px;

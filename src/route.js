@@ -9,7 +9,7 @@ const getLine = (id) => RADIO_LINES.find((l) => l.id === id);
 export const WAVES = [
   {
     country: 'Kazakhstan',
-    musicKey: 'kazakhstan', // audio.js's per-country music track (see setMusicCountry/musicManager.js)
+    musicKey: 'kazakhstan', // audio.js's setMusicForState('FLYING', ...) track key (see musicManager.js)
     duration: 95, // seconds of flight time before the next transition
     missileSpawnMin: 25,
     missileSpawnMax: 35,
@@ -309,11 +309,16 @@ export class Route {
     }
   }
 
+  // Deliberately does NOT itself start wave.musicKey playing — that decision
+  // belongs solely to main.js's setMusicForState('FLYING', ...), called at
+  // the exact moment the state machine actually enters FLYING (or advances
+  // a wave within it). This constructor runs for a placeholder MENU-backdrop
+  // Route too (see resetToMenu()), so if it started music directly here,
+  // every return-to-menu would restart the new wave's track behind the menu.
   _applyWave(index) {
     const wave = WAVES[index];
     this.threats.setWaveConfig(wave);
     this.world.setCountry(wave);
-    this.audio.setMusicCountry(wave.musicKey);
     // Kick off the NEXT wave's track decode now, while this one plays, so
     // there's no load gap when the player actually gets there.
     const nextWave = WAVES[index + 1];
