@@ -208,73 +208,97 @@ html, body {
 }
 
 /* First-load gate (main.js's splash-before-the-menu) — logo/wordmark/tagline
-   above (already in #menu-title) stay exactly as they are; this just adds
-   the signature yellow bottle + a pulsing prompt in their place, and hides
-   the button rule/list/status-strip underneath so the very first frame reads
-   as a title card, not a menu with nothing to click yet. display:none (not
-   opacity) so the collapsed state costs zero layout height — the ordinary
-   post-dismiss menu keeps the exact vertical rhythm it already had before
-   this existed. main.js toggles #menu-shell's .splash-active and swaps
-   which side of this is shown; there is no animated crossfade between the
-   two states, matching every other instant show/hide in this menu (see
-   #menu-shell.hidden itself). */
-#splash-bottle {
-  display: none;
-  position: relative;
-  width: 14px;
-  height: 22px;
-  margin: 0 auto 14px;
+   above (already in #menu-title) stay exactly as they are structurally, just
+   resized down for this state (see #menu-shell.splash-active #menu-logo
+   below); this section adds the pulsing "press to start" box in place of
+   the button rule/list/status-strip, hidden underneath so the very first
+   frame reads as a title card, not a menu with nothing to click yet.
+   display:none (not opacity) so the collapsed state costs zero layout
+   height — the ordinary post-dismiss menu keeps the exact vertical rhythm
+   it already had before this existed. main.js toggles #menu-shell's
+   .splash-active and swaps which side of this is shown; there is no
+   animated crossfade between the two states, matching every other instant
+   show/hide in this menu (see #menu-shell.hidden itself). */
+#menu-shell.splash-active #menu-logo {
+  width: 130px;
+  height: 130px;
 }
 
-#menu-shell.splash-active #splash-bottle {
+/* Splash gets its own, deeper background treatment than the regular menu's
+   #menu-dim/#menu-vignette (35% + soft corner vignette) — a flat 55% black
+   scrim plus its own subtle vignette, swapped in for #menu-dim/#menu-vignette
+   while the splash is up rather than stacked on top of them. The room stays
+   visible but muted; text reads confidently placed anywhere on screen, not
+   fighting the live backdrop for contrast. */
+#menu-shell.splash-active #menu-dim,
+#menu-shell.splash-active #menu-vignette {
+  display: none;
+}
+
+#splash-scrim,
+#splash-vignette {
+  display: none;
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+#menu-shell.splash-active #splash-scrim,
+#menu-shell.splash-active #splash-vignette {
   display: block;
 }
 
-#splash-bottle-neck {
-  position: absolute;
-  left: 50%;
-  top: 0;
-  transform: translateX(-50%);
-  width: 5px;
-  height: 7px;
-  background: #f5c518;
+#splash-scrim {
+  background: rgba(0, 0, 0, 0.55);
 }
 
-#splash-bottle-body {
-  position: absolute;
-  left: 50%;
-  top: 6px;
-  transform: translateX(-50%);
-  width: 12px;
-  height: 16px;
-  border-radius: 2px;
-  background: #f5c518;
-  box-shadow: 0 0 8px rgba(245, 197, 24, 0.5);
+#splash-vignette {
+  background: radial-gradient(ellipse at center, transparent 40%, rgba(0, 0, 0, 0.4) 100%);
 }
 
+/* Generous gap before the prompt — bigger than #menu-rule's own 26px, since
+   the prompt now reads as a distinct, deliberate call-to-action rather than
+   the next line of title copy. */
+#menu-shell.splash-active #menu-title {
+  margin-bottom: 56px;
+}
+
+/* "PRESS TO START": a bordered, padded box (not just a text line) so it
+   unmistakably reads as the one clickable thing on screen — click/keydown
+   dismissal is still handled globally in main.js (anywhere on screen, any
+   key); this box is purely the visual affordance pointing at that. */
 #splash-prompt {
   display: none;
   font-family: var(--font-mono);
   font-weight: 600;
-  font-size: 13px;
+  font-size: 14px;
   letter-spacing: 0.2em;
   text-transform: uppercase;
   color: #f5c518;
   text-align: center;
-  margin-bottom: 26px;
-  animation: splashPromptPulse 1.6s ease-in-out infinite;
+  border: 1px solid #f5c518;
+  padding: 16px 32px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  animation: splashPromptPulse 2s ease-in-out infinite;
 }
 
 #menu-shell.splash-active #splash-prompt {
   display: block;
 }
 
+#splash-prompt:hover {
+  color: #ffe680;
+  border-color: #ffe680;
+  box-shadow: 0 0 14px rgba(245, 197, 24, 0.35);
+}
+
 @keyframes splashPromptPulse {
   0%, 100% {
-    opacity: 0.5;
+    opacity: 1;
   }
   50% {
-    opacity: 1;
+    opacity: 0.45;
   }
 }
 
