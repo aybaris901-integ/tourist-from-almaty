@@ -512,15 +512,35 @@ export class UI {
     ctx.fillRect(x - 1.5, y - 10, 3, 4); // bottle neck
   }
 
+  // Run telemetry recap (see route.js's _logWaveSummary/lastWaveSummary):
+  // two compact monospace lines summarizing the wave attempt that just
+  // ended — "why did I die" without having to dig through the console.
+  // Shared by the transition card (pass) and the panic screen (panic).
+  _waveSummaryLines(s) {
+    return [
+      `${s.timeSurvived.toFixed(0)}s · missiles ${s.missilesDodged}/${s.missilesLaunched} dodged, ${s.missilesHit} hit · fighter bursts ${s.fighterBurstsHit}`,
+      `radio ${s.radioAnswered}/${s.radioOffered} answered · fear peak ${s.fearPeak.toFixed(0)} avg ${s.fearAverage.toFixed(0)}` +
+        (s.topFearSource ? ` · biggest: ${s.topFearSource} (+${s.topFearAmount.toFixed(0)})` : ''),
+    ];
+  }
+
   _drawTransitionCard(route, w, h) {
     if (route.phase !== 'transition') return;
     const ctx = this.ctx;
     const cx = w / 2;
     const cy = h / 2;
 
+    // lastWaveSummary is null for the very first (game-intro) transition
+    // card — nothing has ended yet — and always reflects the wave that just
+    // passed for every later one (route.js sets it right before entering
+    // 'transition'), so no extra identity check is needed here.
+    const summary = route.lastWaveSummary;
+    const summaryLines = summary ? this._waveSummaryLines(summary) : [];
+    const boxH = summaryLines.length ? 110 + summaryLines.length * 16 + 10 : 110;
+
     ctx.save();
     ctx.fillStyle = 'rgba(0,0,0,0.55)';
-    ctx.fillRect(cx - 240, cy - 55, 480, 110);
+    ctx.fillRect(cx - 240, cy - 55, 480, boxH);
 
     ctx.font = '700 34px "Segoe UI", system-ui, sans-serif';
     ctx.fillStyle = ACCENT_COLOR;
@@ -531,6 +551,12 @@ export class UI {
     ctx.font = '400 14px "Segoe UI", system-ui, sans-serif';
     ctx.fillStyle = 'rgba(242,242,234,0.75)';
     ctx.fillText('Entering airspace...', cx, cy + 24);
+
+    if (summaryLines.length) {
+      ctx.font = '12px "Consolas", "Courier New", monospace';
+      ctx.fillStyle = 'rgba(242,242,234,0.6)';
+      summaryLines.forEach((line, i) => ctx.fillText(line, cx, cy + 48 + i * 16));
+    }
     ctx.restore();
   }
 
@@ -594,15 +620,23 @@ export class UI {
     ctx.fillStyle = 'rgba(242,242,234,0.75)';
     ctx.fillText(`Заново: ${WAVES[route.waveIndex].country}`, cx, cy + 4);
 
+    if (route.lastWaveSummary) {
+      ctx.font = '12px "Consolas", "Courier New", monospace';
+      ctx.fillStyle = 'rgba(242,242,234,0.55)';
+      this._waveSummaryLines(route.lastWaveSummary).forEach((line, i) => ctx.fillText(line, cx, cy + 32 + i * 16));
+    }
+
     ctx.restore();
 
     this._drawBottleIcon(w - 36, h - 36); // full opacity regardless of the title's fade
   }
 
   // D key — live view of the fear economy rebalance: current value vs. the
-  // wave's floor, and which continuous sources (calm-decay, missile-lockon,
-  // missile-close, fighter-presence...) are touching fear THIS frame. Plain
-  // monospace panel, functional not pretty — this is a tuning tool.
+  // wave's floor, and which continuous sources (calm-decay, missile-close...)
+  // are touching fear THIS frame — lock-on/launch/fighter fear are all
+  // one-shot spikes now (see threats.js's _addNonActionableFear), so they
+  // never show up here. Plain monospace panel, functional not pretty — this
+  // is a tuning tool.
   _drawDebugOverlay(fear, threats, route, w, h) {
     if (!this._debugVisible) return;
     const ctx = this.ctx;

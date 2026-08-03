@@ -1,5 +1,6 @@
 import { randRange } from './utils.js';
 import RADIO_LINES from './radio_lines.json';
+import { WAVES } from './route.js';
 
 export const CONFIG = {
   CALL_INTERVAL_MIN: 25,
@@ -31,12 +32,26 @@ export class Radio {
     this.answerTimer = 0;
 
     this._cooldownTimer = 0;
-    this._nextCallTimer = randRange(CONFIG.CALL_INTERVAL_MIN, CONFIG.CALL_INTERVAL_MAX);
+    this._nextCallTimer = randRange(...this._callIntervalFor(0));
     this._fear = null;
     this._forcedLine = null;
     this._waveIndex = 0; // updated each frame via update()'s waveIndex param
 
+    // Per-attempt run telemetry — reset by route.js at the start of every
+    // wave attempt, read back via getWaveStats() the instant it ends.
+    this._statCallsOffered = 0;
+    this._statCallsAnswered = 0;
+
     this._bindKeys();
+  }
+
+  resetWaveStats() {
+    this._statCallsOffered = 0;
+    this._statCallsAnswered = 0;
+  }
+
+  getWaveStats() {
+    return { callsOffered: this._statCallsOffered, callsAnswered: this._statCallsAnswered };
   }
 
   // route.js uses this for the Kazakhstan wave's scripted intro call —
@@ -104,6 +119,7 @@ export class Radio {
     this.answerTimer = CONFIG.ANSWER_WINDOW;
     this.audio.setMusicDucked(true);
     this.audio.playVoiceLine(line.speaker, line.prompt.length);
+    this._statCallsOffered += 1;
     console.log('[radio] incoming call');
   }
 
@@ -111,6 +127,7 @@ export class Radio {
     const chosen = this.options[index];
     console.log(`[radio] answered: "${chosen}"`);
     this._fear.addInstant('radio-answer', CONFIG.FEAR_ANSWER_DELTA);
+    this._statCallsAnswered += 1;
     this._endCall();
   }
 
@@ -135,12 +152,22 @@ export class Radio {
     this.options = [];
     this.answerTimer = 0;
     this._cooldownTimer = 0;
-    this._nextCallTimer = randRange(CONFIG.CALL_INTERVAL_MIN, CONFIG.CALL_INTERVAL_MAX);
+    this._nextCallTimer = randRange(...this._callIntervalFor(0));
     this._forcedLine = null;
   }
 
+  // WAVES entries carry their own radioIntervalMin/Max (see route.js); fall
+  // back to the global CONFIG defaults for any wave that doesn't set them.
+  _callIntervalFor(waveIndex) {
+    const wave = WAVES[waveIndex];
+    return [
+      wave?.radioIntervalMin ?? CONFIG.CALL_INTERVAL_MIN,
+      wave?.radioIntervalMax ?? CONFIG.CALL_INTERVAL_MAX,
+    ];
+  }
+
   _rollNextCallInterval() {
-    const interval = randRange(CONFIG.CALL_INTERVAL_MIN, CONFIG.CALL_INTERVAL_MAX);
+    const interval = randRange(...this._callIntervalFor(this._waveIndex));
     const highFear = this._fear && this._fear.value > CONFIG.HIGH_FEAR_THRESHOLD;
     return highFear ? interval * CONFIG.HIGH_FEAR_INTERVAL_MULT : interval;
   }

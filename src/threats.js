@@ -81,6 +81,11 @@ export const CONFIG = {
   // later waves.
   DODGE_WINDOW_ENTER: 700,
   DODGE_WINDOW_BREAK: 500,
+  // Late-wave mercy (route.js's MERCY_FEAR_THRESHOLD/MERCY_LATE_WAVE_FRACTION
+  // decide WHEN this is active per-wave, gated by WAVES[i].mercyEnabled) —
+  // widens the dodge window so the end of a leg tests skill, not delivers an
+  // unrecoverable pile-up. See setMercyActive/_dodgeWindowBonusMultiplier.
+  MERCY_DODGE_WINDOW_MULT: 1.2,
   // Forgiving dodge check: from the moment the window opens, ANY hard yank
   // of the stick — roll or pitch, either direction — permanently breaks the
   // missile's lock (see _updateDodgeWindow/_updatePlayerAngularState).
@@ -98,11 +103,30 @@ export const CONFIG = {
   SCRIPTED_MISSILE_LIFETIME: 18, // fixed, not the geometric formula: this missile can be slower than the player, which that formula assumes never happens
   SCRIPTED_FAIL_FEAR: 20,
 
-  FEAR_LOCKON_PER_SEC: 6,
-  FEAR_CLOSE_PER_SEC: 12,
+  // Lock-on used to be a continuous per-second drain for its whole duration
+  // — an unavoidable tax the player couldn't act on (only the missile that
+  // eventually launches is actionable). Now it's two one-shot jolts instead:
+  // the lock starting ("someone's aiming at me") and the missile actually
+  // launching. Both go through _addNonActionableFear (see its own comment),
+  // sharing one NON_ACTIONABLE_FEAR_CAP_PER_WAVE budget with the fighter
+  // approach spikes (FEAR_FIGHTER_VIEW_ENTER_INSTANT/CLOSE_PASS_INSTANT/
+  // LINEUP_INSTANT below) — none of these are things the player can act on
+  // to prevent, so together they can never be the PRIMARY cause of a panic.
+  // Actual combat resolutions (missile hit/near-miss/dodge, fighter gun hit/
+  // near-miss) are real EVENTS driven by play, not ambient jolts, and stay
+  // uncapped.
+  FEAR_LOCKON_START_INSTANT: 10,
+  FEAR_LAUNCH_INSTANT: 8,
+  NON_ACTIONABLE_FEAR_CAP_PER_WAVE: 40,
+  FEAR_CLOSE_PER_SEC: 12, // kept continuous deliberately — THIS is actionable ("break now"), unlike lock-on/launch
   FEAR_NEAR_MISS_INSTANT: 15,
   FEAR_DODGE_INSTANT: 12,
-  FEAR_HIT_INSTANT: 45, // fear IS the health system — no separate hit counter/HP bar
+  FEAR_HIT_INSTANT: 32, // fear IS the health system — no separate hit counter/HP bar
+  // Rapid-fire hits get scarier, not just additive: any hit landing within
+  // FEAR_HIT_STACK_WINDOW of the previous one tacks on this extra bump — two
+  // hits close together should be survivable-but-scary, three should kill.
+  FEAR_HIT_STACK_BONUS: 8,
+  FEAR_HIT_STACK_WINDOW: 30, // seconds since the last hit
 
   TUMBLE_DURATION: 2,
   IMPACT_SHAKE_DURATION: 0.6,
@@ -225,7 +249,18 @@ export const CONFIG = {
   FIGHTER_CATCHUP_DIST: 2000, // straight-line distance from the PLAYER past which...
   FIGHTER_CATCHUP_SPEED_MULT: 1.4, // ...this multiplier overrides everything else, until back in range
   FIGHTER_VISIBLE_RANGE: 3000,
-  FEAR_FIGHTER_PER_SEC: 3, // PATROL/COOLDOWN/closing presence, front hemisphere only
+  // Fighter fear is a SPIKE, not a faucet: a continuous per-second presence
+  // drain punished the player for a fighter merely existing on screen, with
+  // no action or mistake involved — pure unavoidable pressure. Each of these
+  // fires once per fighter per approach (see _spawnFighter's reset of
+  // f._viewSpikeFired/_closeSpikeFired, and _updateAttack's lineup-phase
+  // transition for the lineup spike) instead of ticking every frame. These
+  // (plus missile lock-on-start/launch, see FEAR_LOCKON_START_INSTANT/
+  // FEAR_LAUNCH_INSTANT) go through the shared NON_ACTIONABLE_FEAR_CAP_PER_WAVE
+  // budget — see _addNonActionableFear.
+  FEAR_FIGHTER_VIEW_ENTER_INSTANT: 8, // first frame a fighter is in front-hemisphere view
+  FEAR_FIGHTER_CLOSE_PASS_INSTANT: 6, // first frame it passes within FIGHTER_CLOSE_PASS_RADIUS
+  FIGHTER_CLOSE_PASS_RADIUS: 300,
   FIGHTER_MAX_BANK_DEG: 60,
   FIGHTER_BANK_GAIN: 1.4, // converts yaw rate (rad/s) into a bank angle target
   FIGHTER_BANK_SMOOTH_TIME: 0.35,
@@ -250,7 +285,12 @@ export const CONFIG = {
   ATTACK_TRACER_SPEED: 1600,
   ATTACK_TRACER_HIT_SPREAD: 20, // aim jitter around the player when the roll says "hit"
   ATTACK_TRACER_MISS_SPREAD: 160, // aim offset when the roll says "miss" — a clean, readable near-miss
-  FEAR_FIGHTER_LINEUP_PER_SEC: 8, // being lined up on is scarier than mere presence
+  // One-shot the instant a line-up begins — telegraphs an incoming burst the
+  // player can't yet do anything about, so (like lock-on-start/launch) it
+  // draws from NON_ACTIONABLE_FEAR_CAP_PER_WAVE. The burst's actual
+  // resolution (FEAR_GUN_HIT_INSTANT/FEAR_GUN_NEAR_MISS_INSTANT below) is a
+  // real combat outcome, not a jolt, and stays uncapped.
+  FEAR_FIGHTER_LINEUP_INSTANT: 12,
   COOLDOWN_MIN: 8,
   COOLDOWN_MAX: 12,
   ATTACK_INTERVAL_MIN: 12, // fallback if a wave doesn't set fighterAttackIntervalMin/Max
@@ -369,6 +409,9 @@ export class Threats {
     this._missileSpeed = CONFIG.MISSILE_SPEED;
     this._dodgeWindowEnter = CONFIG.DODGE_WINDOW_ENTER;
     this._dodgeWindowBreak = CONFIG.DODGE_WINDOW_BREAK;
+    this._entryBonus = null;
+    this._entryBonusTimer = 0;
+    this._mercyActive = false;
     this._missilesPerSpawn = 1;
     this._maxMissilesThisWave = Infinity;
     this._missilesThisWave = 0;
@@ -376,6 +419,16 @@ export class Threats {
     this._breakCuePending = false; // one-shot flag, drained by ui.js via consumeBreakCue()
     this._scriptedResult = null; // one-shot 'success'|'fail', drained by route.js via consumeScriptedResult()
     this.dodgeCount = 0; // total successful dodges this session — ui.js drops the BREAK cue's arrows past 3
+    this._timeSinceLastHit = Infinity; // see _resolveHit's FEAR_HIT_STACK_BONUS
+    this._nonActionableFearThisWave = 0; // see _addNonActionableFear/CONFIG.NON_ACTIONABLE_FEAR_CAP_PER_WAVE
+
+    // Per-attempt run telemetry — reset by route.js at the start of every
+    // wave attempt (see resetWaveStats()), read back via getWaveStats() the
+    // instant that attempt ends (pass or panic).
+    this._statMissilesLaunched = 0;
+    this._statMissilesDodged = 0; // any non-hit resolution (clean dodge or scary-but-survived near-miss)
+    this._statMissilesHit = 0;
+    this._statFighterBurstsHit = 0;
 
     // Player angular-velocity tracking for the forgiving dodge check (see
     // _updatePlayerAngularState/_updateDodgeWindow) — frame-to-frame deltas
@@ -481,6 +534,8 @@ export class Threats {
         inFront: false,
         threatening: false, // hasActiveThreats() reads this: front-hemisphere presence OR any ATTACK phase
         radarLineup: false, // ui.js's radar draws an orange dot while true
+        _viewSpikeFired: false, // one-shot FEAR_FIGHTER_VIEW_ENTER_INSTANT, reset per approach in _spawnFighter
+        _closeSpikeFired: false, // one-shot FEAR_FIGHTER_CLOSE_PASS_INSTANT, reset per approach in _spawnFighter
         attackTimer: 0, // PATROL countdown to the next attack attempt
         attackSide: 1,
         attackAngle: 0,
@@ -531,16 +586,80 @@ export class Threats {
     this._calmMax = wave.calmMax;
     this._activeMin = wave.activeMin;
     this._activeMax = wave.activeMax;
+
+    // Carries a wider dodge window in from the previous wave for a few
+    // seconds, decaying linearly to normal — see _dodgeWindowBonusMultiplier.
+    this._entryBonus = wave.entryBonus ?? null;
+    this._entryBonusTimer = this._entryBonus ? this._entryBonus.duration : 0;
+    this._mercyActive = false;
+  }
+
+  // route.js drives this every frame from its own late-wave-mercy check
+  // (final MERCY_LATE_WAVE_FRACTION of the wave + fear above
+  // MERCY_FEAR_THRESHOLD + WAVES[i].mercyEnabled) — see _dodgeWindowBonusMultiplier.
+  setMercyActive(active) {
+    this._mercyActive = active;
+  }
+
+  // Combines the post-tutorial entry-bonus carryover (ramps from
+  // entryBonus.windowMultiplier down to 1 over entryBonus.duration) with the
+  // late-wave mercy bonus (flat MERCY_DODGE_WINDOW_MULT while active) — both
+  // widen the dodge window, and the rare case of both applying at once is
+  // fine to just stack multiplicatively.
+  _dodgeWindowBonusMultiplier() {
+    let mult = 1;
+    if (this._entryBonus && this._entryBonusTimer > 0) {
+      const t = this._entryBonusTimer / this._entryBonus.duration;
+      mult *= 1 + (this._entryBonus.windowMultiplier - 1) * t;
+    }
+    if (this._mercyActive) mult *= CONFIG.MERCY_DODGE_WINDOW_MULT;
+    return mult;
+  }
+
+  // route.js calls this at the start of every wave attempt (fresh wave,
+  // panic retry, or manual restart) — see getWaveStats() for the read side.
+  resetWaveStats() {
+    this._statMissilesLaunched = 0;
+    this._statMissilesDodged = 0;
+    this._statMissilesHit = 0;
+    this._statFighterBurstsHit = 0;
+    this._timeSinceLastHit = Infinity;
+    this._nonActionableFearThisWave = 0;
+  }
+
+  // Every "unavoidable jolt" fear addition — missile lock-on-start/launch,
+  // fighter approach/lineup spikes — goes through here instead of a direct
+  // fear.addInstant(), so together they can never exceed
+  // CONFIG.NON_ACTIONABLE_FEAR_CAP_PER_WAVE for a single wave attempt. Real
+  // combat-resolution events (missile hit/near-miss/dodge, fighter gun hit/
+  // near-miss) call fear.addInstant() directly and stay uncapped — the
+  // player earned those through play, they're not ambient pressure.
+  _addNonActionableFear(fear, source, amount) {
+    const remaining = CONFIG.NON_ACTIONABLE_FEAR_CAP_PER_WAVE - this._nonActionableFearThisWave;
+    if (remaining <= 0) return;
+    const applied = Math.min(amount, remaining);
+    fear.addInstant(source, applied);
+    this._nonActionableFearThisWave += applied;
+  }
+
+  getWaveStats() {
+    return {
+      missilesLaunched: this._statMissilesLaunched,
+      missilesDodged: this._statMissilesDodged,
+      missilesHit: this._statMissilesHit,
+      fighterBurstsHit: this._statFighterBurstsHit,
+    };
   }
 
   // Entering calm (natural gap, forced transition, or restart) clears any
   // active fighter immediately — they're presence-only with no resolution
   // tied to natural expiry, and their lifetime can outlast the calm window,
-  // so leaving one up would silently break the "no threats" guarantee (and
-  // keep ticking fighter-presence fear). An in-flight missile is left alone
-  // to resolve naturally (hit/dodge/near-miss) — its bounded 8s lifetime
-  // fits inside any calm window this short, so cutting it off would only
-  // rob the player of a dodge payoff without buying anything.
+  // so leaving one up would silently break the "no threats" guarantee (it
+  // would still read as f.threatening via hasActiveThreats()). An in-flight
+  // missile is left alone to resolve naturally (hit/dodge/near-miss) — its
+  // bounded 8s lifetime fits inside any calm window this short, so cutting
+  // it off would only rob the player of a dodge payoff without buying
+  // anything.
   //
   // MUST go through _despawnFighter (not just active=false/visible=false
   // inline) — that's what resets spawnTimer. Fighters never reset it
@@ -569,11 +688,13 @@ export class Threats {
 
   update(dt, gameDt, flight, fear, radio) {
     if (this._lockImmuneTimer > 0) this._lockImmuneTimer -= dt;
+    if (this._entryBonusTimer > 0) this._entryBonusTimer = Math.max(0, this._entryBonusTimer - dt);
+    this._timeSinceLastHit += dt;
     this._updateSlowmo(dt);
     this._updateWave(dt);
 
     if (this._wavePhase !== 'calm') {
-      this._updateMissileSpawning(dt, flight);
+      this._updateMissileSpawning(dt, flight, fear);
     }
 
     this._updateMissiles(dt, gameDt, flight, fear, radio);
@@ -620,7 +741,7 @@ export class Threats {
     }
   }
 
-  _updateMissileSpawning(dt, flight) {
+  _updateMissileSpawning(dt, flight, fear) {
     if (!this.spawningEnabled) return;
     if (this._missilesThisWave >= this._maxMissilesThisWave) return;
     // Post-hit counterplay window: no NEW lock-ons while immune (timer just
@@ -635,13 +756,16 @@ export class Threats {
     for (let i = 0; i < count; i++) {
       const slot = this._missiles.find((m) => !m.active);
       if (!slot) break;
-      this._beginLockOn(slot, flight);
+      this._beginLockOn(slot, flight, fear);
       this._missilesThisWave += 1;
     }
     this._nextMissileTimer = randRange(this._missileSpawnMin, this._missileSpawnMax);
   }
 
-  _beginLockOn(slot, flight) {
+  // Lock starting is a one-shot jolt now, not a per-second drain (see
+  // CONFIG.FEAR_LOCKON_START_INSTANT's comment) — the player can't act on a
+  // lock itself, only on the missile once it actually launches.
+  _beginLockOn(slot, flight, fear) {
     // Front-side arcs (30-120 deg off the nose, either side) so the homing
     // approach crosses the player's actual forward view instead of chasing
     // in from behind, where the cockpit literally cannot see it — that was
@@ -672,6 +796,7 @@ export class Threats {
     slot.scripted = false;
 
     this.audio.startLockTone();
+    this._addNonActionableFear(fear, 'missile-lockon-start', CONFIG.FEAR_LOCKON_START_INSTANT);
     console.log('[threats] lock-on warning');
   }
 
@@ -680,10 +805,10 @@ export class Threats {
   // is 0). Overrides this one missile's speed and dodge-window thresholds
   // relative to whatever the wave's own values are (see setWaveConfig) — the
   // multipliers are the wave's scriptedTutorial config in route.js.
-  spawnScriptedMissile(flight, { speedMultiplier, windowMultiplier }) {
+  spawnScriptedMissile(flight, fear, { speedMultiplier, windowMultiplier }) {
     const slot = this._missiles.find((m) => !m.active);
     if (!slot) return;
-    this._beginLockOn(slot, flight);
+    this._beginLockOn(slot, flight, fear);
     slot.scripted = true;
     slot.scriptedSpeed = this._missileSpeed * speedMultiplier;
     slot.scriptedWindowEnter = this._dodgeWindowEnter * windowMultiplier;
@@ -699,7 +824,7 @@ export class Threats {
     return result;
   }
 
-  _launchMissile(m, flight) {
+  _launchMissile(m, flight, fear) {
     m.state = 'homing';
     if (m.scripted) {
       // Fixed, not the geometric formula — a slow scripted missile can be
@@ -715,6 +840,8 @@ export class Threats {
     m.mesh.quaternion.setFromUnitVectors(FORWARD, m.direction);
     m.mesh.visible = true;
     this.audio.stopLockTone();
+    this._statMissilesLaunched += 1;
+    this._addNonActionableFear(fear, 'missile-launch', CONFIG.FEAR_LAUNCH_INSTANT);
     console.log('[threats] missile launched');
   }
 
@@ -789,8 +916,9 @@ export class Threats {
   // missile's life. The one exception: swinging the nose INTO the missile's
   // own flight direction doesn't count (see DODGE_INTO_MISSILE_EXCLUDE_DEG).
   _updateDodgeWindow(m, dist) {
-    const enterRange = m.scripted ? m.scriptedWindowEnter : this._dodgeWindowEnter;
-    const breakRange = m.scripted ? m.scriptedWindowBreak : this._dodgeWindowBreak;
+    const bonusMult = m.scripted ? 1 : this._dodgeWindowBonusMultiplier();
+    const enterRange = (m.scripted ? m.scriptedWindowEnter : this._dodgeWindowEnter) * bonusMult;
+    const breakRange = (m.scripted ? m.scriptedWindowBreak : this._dodgeWindowBreak) * bonusMult;
 
     if (m.dodgeWindowState === 'none' && dist <= enterRange) {
       m.dodgeWindowState = 'entered';
@@ -834,13 +962,12 @@ export class Threats {
 
       if (m.state === 'lockon') {
         anyLockOn = true;
-        fear.addContinuous('missile-lockon', CONFIG.FEAR_LOCKON_PER_SEC, dt);
         m.lockTimer -= dt;
         const dist = m.spawnPos.distanceTo(flight.position);
         if (!nearestLockOn || dist < nearestLockOn.dist) {
           nearestLockOn = { dist, progress: 1 - m.lockTimer / CONFIG.MISSILE_LOCKON_DURATION, pan: this._panFor(m.spawnPos, flight, flatRight) };
         }
-        if (m.lockTimer <= 0) this._launchMissile(m, flight);
+        if (m.lockTimer <= 0) this._launchMissile(m, flight, fear);
         continue;
       }
 
@@ -992,13 +1119,20 @@ export class Threats {
       this._resolveScriptedFail(m, flight, fear);
       return;
     }
-    fear.addInstant('missile-hit', CONFIG.FEAR_HIT_INSTANT);
+    // Stacking penalty: a hit landing within FEAR_HIT_STACK_WINDOW of the
+    // previous one is scarier than an isolated one — two close together
+    // should be survivable-but-scary, three should kill.
+    const stacked = this._timeSinceLastHit < CONFIG.FEAR_HIT_STACK_WINDOW;
+    const hitFear = CONFIG.FEAR_HIT_INSTANT + (stacked ? CONFIG.FEAR_HIT_STACK_BONUS : 0);
+    fear.addInstant('missile-hit', hitFear);
+    this._timeSinceLastHit = 0;
     flight.triggerTumble(CONFIG.TUMBLE_DURATION);
     flight.triggerImpactShake(CONFIG.IMPACT_SHAKE_DURATION, CONFIG.IMPACT_SHAKE_MAG);
     this.audio.playImpactThud();
     this._spawnPuff(m.position, 0xffb066);
     this._despawnMissile(m);
     this._lockImmuneTimer = CONFIG.POST_HIT_LOCK_IMMUNITY;
+    this._statMissilesHit += 1;
 
     console.log('[threats] HIT');
   }
@@ -1021,6 +1155,7 @@ export class Threats {
 
   _resolveExpiry(m, fear, radio) {
     const scripted = m.scripted;
+    this._statMissilesDodged += 1;
     if (m.minDistance <= CONFIG.MISSILE_NEAR_MISS_RADIUS) {
       fear.addInstant('near-miss-explosion', CONFIG.FEAR_NEAR_MISS_INSTANT);
       this._spawnPuff(m.position, 0xff6644);
@@ -1285,19 +1420,22 @@ export class Threats {
       const toFighter = f.mesh.position.clone().sub(flight.position);
       const dist = toFighter.length();
       const inFront = dist > 1 && dist < CONFIG.FIGHTER_VISIBLE_RANGE && flatForward.dot(toFighter.clone().normalize()) > 0;
-      const lineupActive = f.state === 'attack' && f.attackPhase === 'lineup';
       f.inFront = inFront;
       // hasActiveThreats() reads this: an attacking fighter is a real threat
       // even while approaching from behind (outside the front-hemisphere
       // check below), which is the whole point of a rear-quarter attack.
       f.threatening = f.state === 'attack' || inFront;
 
-      const presencePhase = f.state === 'patrol' || f.state === 'cooldown' || (f.state === 'attack' && f.attackPhase === 'closing');
-      if (inFront && presencePhase) {
-        fear.addContinuous('fighter-presence', CONFIG.FEAR_FIGHTER_PER_SEC, dt);
+      // One-shot spikes, not a per-frame drain (see CONFIG.FEAR_FIGHTER_VIEW_
+      // ENTER_INSTANT's comment) — each fires once per approach (reset in
+      // _spawnFighter), the instant its trigger condition first becomes true.
+      if (inFront && !f._viewSpikeFired) {
+        f._viewSpikeFired = true;
+        this._addNonActionableFear(fear, 'fighter-view-enter', CONFIG.FEAR_FIGHTER_VIEW_ENTER_INSTANT);
       }
-      if (lineupActive) {
-        fear.addContinuous('fighter-lineup', CONFIG.FEAR_FIGHTER_LINEUP_PER_SEC, dt);
+      if (dist < CONFIG.FIGHTER_CLOSE_PASS_RADIUS && !f._closeSpikeFired) {
+        f._closeSpikeFired = true;
+        this._addNonActionableFear(fear, 'fighter-close-pass', CONFIG.FEAR_FIGHTER_CLOSE_PASS_INSTANT);
       }
       if (f.burstJustStarted) {
         this.audio.playGunBurst(this._panFor(f.mesh.position, flight, flatRight));
@@ -1405,6 +1543,7 @@ export class Threats {
         f.lineupTimer = CONFIG.ATTACK_LINEUP_DURATION;
         f.radarLineup = true;
         this.audio.playFighterLineupCue(this._panFor(f.mesh.position, flight, flatRight));
+        this._addNonActionableFear(fear, 'fighter-lineup-start', CONFIG.FEAR_FIGHTER_LINEUP_INSTANT);
         console.log('[threats] fighter lining up');
       } else if (f.closingTimer > CONFIG.ATTACK_CLOSING_TIMEOUT) {
         this._abortAttack(f);
@@ -1450,7 +1589,9 @@ export class Threats {
   // Hit/miss is decided at line-up's end (f.attackHit) so every tracer this
   // burst aims consistently; the fear/tumble/shake consequence lands here,
   // ATTACK_TRACER_TRAVEL_TIME into the burst — not instantly on trigger,
-  // matching the tracers' actual travel time.
+  // matching the tracers' actual travel time. A real combat resolution, not
+  // an ambient jolt — deliberately NOT routed through _addNonActionableFear
+  // (the line-up leading into it already drew from that budget).
   _resolveAttackBurst(f, flight, fear) {
     if (f.attackHit) {
       fear.addInstant('fighter-gun-hit', CONFIG.FEAR_GUN_HIT_INSTANT);
@@ -1458,6 +1599,7 @@ export class Threats {
       flight.triggerImpactShake(CONFIG.GUN_HIT_IMPACT_SHAKE_DURATION, CONFIG.GUN_HIT_IMPACT_SHAKE_MAG);
       this.audio.playImpactThud();
       this._lockImmuneTimer = CONFIG.POST_HIT_LOCK_IMMUNITY;
+      this._statFighterBurstsHit += 1;
       console.log('[threats] fighter gun HIT');
     } else {
       fear.addInstant('fighter-gun-near-miss', CONFIG.FEAR_GUN_NEAR_MISS_INSTANT);
@@ -1606,6 +1748,8 @@ export class Threats {
     f.state = 'patrol';
     f.attackPhase = null;
     f.radarLineup = false;
+    f._viewSpikeFired = false;
+    f._closeSpikeFired = false;
     f.lifeTimer = randRange(CONFIG.FIGHTER_LIFETIME_MIN, CONFIG.FIGHTER_LIFETIME_MAX);
     f.orbitAngle = Math.random() * Math.PI * 2;
     f.orbitRadius = randRange(CONFIG.FIGHTER_ORBIT_MIN, CONFIG.FIGHTER_ORBIT_MAX);

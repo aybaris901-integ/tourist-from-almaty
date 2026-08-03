@@ -121,7 +121,46 @@ export class Fear {
     // ongoing economy forces, not momentary spikes.
     this._activeSources = new Set();
 
+    // Per-attempt run telemetry (route.js resets this at the start of every
+    // wave attempt — fresh wave, panic retry, or manual restart — and reads
+    // it back via getWaveStats() the instant that attempt ends, pass or
+    // panic). Tracks peak/average fear and which single source (by summed
+    // positive contribution) did the most damage this attempt.
+    this._statsPeak = 0;
+    this._statsSum = 0; // integral of value*dt, for the time-weighted average
+    this._statsTime = 0;
+    this._statsContrib = {}; // source -> total positive fear added this attempt
+
     this._bindDebugKeys();
+  }
+
+  resetWaveStats() {
+    this._statsPeak = this.value;
+    this._statsSum = 0;
+    this._statsTime = 0;
+    this._statsContrib = {};
+  }
+
+  getWaveStats() {
+    let topSource = null;
+    let topAmount = 0;
+    for (const [source, amount] of Object.entries(this._statsContrib)) {
+      if (amount > topAmount) {
+        topAmount = amount;
+        topSource = source;
+      }
+    }
+    return {
+      peak: this._statsPeak,
+      average: this._statsTime > 0 ? this._statsSum / this._statsTime : this.value,
+      topSource,
+      topAmount,
+    };
+  }
+
+  _trackStats(source, amount) {
+    this._statsPeak = Math.max(this._statsPeak, this.value);
+    if (amount > 0) this._statsContrib[source] = (this._statsContrib[source] || 0) + amount;
   }
 
   _bindDebugKeys() {
@@ -136,6 +175,7 @@ export class Fear {
   addInstant(source, amount) {
     if (this.frozen) return;
     this.value = clamp(this.value + amount, CONFIG.MIN, CONFIG.MAX);
+    this._trackStats(source, amount);
     console.log(`[fear] ${source} ${fmt(amount)} -> ${this.value.toFixed(1)}`);
     this._checkPanic();
   }
@@ -149,6 +189,7 @@ export class Fear {
     this.value = clamp(this.value + amount, CONFIG.MIN, CONFIG.MAX);
     this._logAccum[source] = (this._logAccum[source] || 0) + amount;
     this._activeSources.add(source);
+    this._trackStats(source, amount);
     this._checkPanic();
   }
 
@@ -200,6 +241,8 @@ export class Fear {
   // doesn't matter for a per-second economy.
   update(dt, threatsActive, waveIndex) {
     this._activeSources.clear();
+    this._statsSum += this.value * dt;
+    this._statsTime += dt;
     this.floor = Math.min(CONFIG.FEAR_FLOOR_BASE + CONFIG.FEAR_FLOOR_PER_WAVE * waveIndex, CONFIG.FEAR_FLOOR_MAX);
 
     if (this.panicActive) {

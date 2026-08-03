@@ -11,6 +11,7 @@ export const WAVES = [
     country: 'Kazakhstan',
     musicKey: 'kazakhstan', // audio.js's setMusicForState('FLYING', ...) track key (see musicManager.js)
     duration: 95, // seconds of flight time before the next transition
+    mercyEnabled: true, // late-wave mercy (see MERCY_FEAR_THRESHOLD/MERCY_LATE_WAVE_FRACTION below) — flip off per-wave for higher difficulties
     missileSpawnMin: 25,
     missileSpawnMax: 35,
     missileCount: 0, // the generic random spawner is off — scriptedTutorial below drives wave 1's missile(s) directly
@@ -50,37 +51,50 @@ export const WAVES = [
       retryDelay: 10, // seconds after a forced near-miss before the next attempt
       lines: { briefing: 'kz_dodge_briefing', success: 'kz_dodge_success', fail: 'kz_dodge_fail' },
     },
+    radioIntervalMin: 25,
+    radioIntervalMax: 40,
   },
   {
     country: 'Caspian / Azerbaijan',
     musicKey: 'azerbaijan',
     duration: 100,
-    missileSpawnMin: 15,
-    missileSpawnMax: 15,
+    mercyEnabled: true,
+    missileSpawnMin: 20,
+    missileSpawnMax: 26,
     missileCount: Infinity,
-    missileTurnRate: 60,
-    dodgeWindowEnter: 800,
-    dodgeWindowBreak: 575,
+    missileTurnRate: 52,
+    missileSpeed: 470,
+    dodgeWindowEnter: 1100,
+    dodgeWindowBreak: 800,
     missilesPerSpawn: 1,
     fighterCount: 1, // first fighter appears
     fighterCanAttack: false, // PATROL only — presence and the lazy orbit, no attack runs yet
-    calmMin: 15,
-    calmMax: 20,
+    calmMin: 18,
+    calmMax: 24,
     activeMin: 30,
     activeMax: 40,
     fogColor: 0x7fa6b0, // sea blue-grey
     groundTint: 0x5c7a88,
+    // Kazakhstan's scriptedTutorial ends with a x2 dodge-window bonus that
+    // would otherwise vanish the instant wave 2 starts — a x1.4 carryover
+    // for the first 30s of Azerbaijan (decaying linearly to normal, see
+    // threats.js's setWaveConfig/_dodgeWindowBonusMultiplier) keeps the step
+    // up from Kazakhstan from feeling like a cliff.
+    entryBonus: { duration: 30, windowMultiplier: 1.4 },
+    radioIntervalMin: 20,
+    radioIntervalMax: 30,
   },
   {
     country: 'Georgia',
     musicKey: 'georgia',
     duration: 105,
+    mercyEnabled: true,
     missileSpawnMin: 12,
     missileSpawnMax: 12,
     missileCount: Infinity,
-    missileTurnRate: 65,
-    dodgeWindowEnter: 750,
-    dodgeWindowBreak: 525,
+    missileTurnRate: 58,
+    dodgeWindowEnter: 950,
+    dodgeWindowBreak: 700,
     missilesPerSpawn: 1,
     fighterCount: 1,
     fighterCanAttack: true, // ATTACK unlocks — rear-quarter runs, stays on for the rest of the route
@@ -93,17 +107,24 @@ export const WAVES = [
     activeMax: 35,
     fogColor: 0x7fae7a, // green hills
     groundTint: 0x4c7a45,
+    // Same post-border recalibration carryover as Azerbaijan's (see its own
+    // comment) — the player is re-learning the timing at every crossing, not
+    // just the first one.
+    entryBonus: { duration: 30, windowMultiplier: 1.4 },
+    radioIntervalMin: 17,
+    radioIntervalMax: 26,
   },
   {
     country: 'Turkey — Inland',
     musicKey: 'turkey',
     duration: 110,
+    mercyEnabled: true,
     missileSpawnMin: 14,
     missileSpawnMax: 18,
     missileCount: Infinity,
-    missileTurnRate: 70,
-    dodgeWindowEnter: 700,
-    dodgeWindowBreak: 500,
+    missileTurnRate: 63,
+    dodgeWindowEnter: 850,
+    dodgeWindowBreak: 620,
     missilesPerSpawn: 2, // pairs
     fighterCount: 1,
     fighterCanAttack: true,
@@ -116,17 +137,21 @@ export const WAVES = [
     activeMax: 30,
     fogColor: 0xb37b5c, // red-brown
     groundTint: 0x8b4c3a,
+    entryBonus: { duration: 30, windowMultiplier: 1.4 },
+    radioIntervalMin: 15,
+    radioIntervalMax: 24,
   },
   {
     country: 'Istanbul Approach',
     musicKey: 'turkey', // Istanbul reuses Turkey's track (one turkey.mp3 covers both, per asset naming)
     duration: 120,
+    mercyEnabled: true,
     missileSpawnMin: 10,
     missileSpawnMax: 14,
     missileCount: Infinity,
-    missileTurnRate: 75,
-    dodgeWindowEnter: 650,
-    dodgeWindowBreak: 450,
+    missileTurnRate: 68,
+    dodgeWindowEnter: 750,
+    dodgeWindowBreak: 550,
     missilesPerSpawn: 2,
     fighterCount: 2,
     fighterCanAttack: true,
@@ -139,6 +164,9 @@ export const WAVES = [
     activeMax: 25,
     fogColor: 0x9fb3c9, // hazy blue
     groundTint: 0x7a93a8,
+    entryBonus: { duration: 30, windowMultiplier: 1.4 },
+    radioIntervalMin: 13,
+    radioIntervalMax: 20,
   },
 ];
 
@@ -146,6 +174,16 @@ const TRANSITION_DURATION = 8; // guaranteed calm between countries
 const INTRO_CARD_DURATION = 5; // first country card at game start
 const RESTART_CALM_DURATION = 4; // breathing room once the player retries out of the panic screen
 const RADIO_INTRO_DELAY = 6; // seconds into wave 1 before the tutorial call rings
+
+// Late-wave mercy: "almost made it" shouldn't end in an unrecoverable
+// pile-up. In the final MERCY_LATE_WAVE_FRACTION of a wave, if fear is above
+// MERCY_FEAR_THRESHOLD, guarantee a radio call within MERCY_CALL_DELAY
+// seconds and widen the dodge window (see threats.js's setMercyActive/
+// CONFIG.MERCY_DODGE_WINDOW_MULT) — gated per-wave by WAVES[i].mercyEnabled
+// so it can be turned off for higher difficulties later.
+const MERCY_LATE_WAVE_FRACTION = 0.75; // final 25% of wave.duration
+const MERCY_FEAR_THRESHOLD = 80;
+const MERCY_CALL_DELAY = 5;
 
 // Stage 7A finale, in-engine, after wave 5's last dodge — see main.js/landing.js
 // for the rest of the sequence (this file only owns the timing/state machine).
@@ -180,6 +218,14 @@ export class Route {
     this.calmPayoffTimer = 0;
     this._calmPayoffFearStart = 0;
     this._radioIntroQueued = startIndex !== 0; // the Kazakhstan-only intro call never fires when starting further along
+    // Run telemetry for the most recently ENDED wave attempt (pass or panic)
+    // — see _logWaveSummary/_resetWaveStats. ui.js reads this to show a
+    // brief recap on the transition card (pass) or panic screen (panic).
+    this.lastWaveSummary = null;
+    // Late-wave mercy — edge-triggers the guaranteed radio call once per
+    // continuous episode of "final stretch + high fear", same armed-flag
+    // pattern as fear.js's own safety valve. See _updateMercy.
+    this._mercyArmed = false;
     // Kazakhstan's scripted dodge tutorial: 'briefing' -> 'waiting_to_spawn'
     // -> 'active' -> 'done'. See _updateTutorial.
     this._tutorial = startIndex === 0 && WAVES[0].scriptedTutorial
@@ -260,6 +306,8 @@ export class Route {
       this._updateTutorial(dt, flight);
     }
 
+    this._updateMercy();
+
     if (this.waveElapsed >= WAVES[this.waveIndex].duration) {
       this._advanceWave();
     }
@@ -287,7 +335,7 @@ export class Route {
     if (t.phase === 'waiting_to_spawn') {
       t.timer -= dt;
       if (t.timer <= 0) {
-        this.threats.spawnScriptedMissile(flight, {
+        this.threats.spawnScriptedMissile(flight, this.fear, {
           speedMultiplier: cfg.speedMultiplier,
           windowMultiplier: cfg.windowMultiplier,
         });
@@ -309,6 +357,29 @@ export class Route {
     }
   }
 
+  // Late-wave mercy: final MERCY_LATE_WAVE_FRACTION of the wave + fear above
+  // MERCY_FEAR_THRESHOLD + WAVES[i].mercyEnabled. Drives threats.js's dodge-
+  // window widening every frame the condition holds, and edge-triggers the
+  // guaranteed radio call exactly once per continuous episode (re-arms if
+  // fear dips back under the threshold or a new stretch is entered later).
+  _updateMercy() {
+    const wave = WAVES[this.waveIndex];
+    const inFinalStretch = this.waveElapsed >= wave.duration * MERCY_LATE_WAVE_FRACTION;
+    const active = (wave.mercyEnabled ?? true) && inFinalStretch && this.fear.value > MERCY_FEAR_THRESHOLD;
+
+    this.threats.setMercyActive(active);
+
+    if (active) {
+      if (!this._mercyArmed) {
+        this._mercyArmed = true;
+        this.radio.forceCallSoon(MERCY_CALL_DELAY);
+        console.log(`[route] late-wave mercy: radio lifeline + wider dodge window (${wave.country})`);
+      }
+    } else {
+      this._mercyArmed = false;
+    }
+  }
+
   // Deliberately does NOT itself start wave.musicKey playing — that decision
   // belongs solely to main.js's setMusicForState('FLYING', ...), called at
   // the exact moment the state machine actually enters FLYING (or advances
@@ -319,13 +390,57 @@ export class Route {
     const wave = WAVES[index];
     this.threats.setWaveConfig(wave);
     this.world.setCountry(wave);
+    this._resetWaveStats();
     // Kick off the NEXT wave's track decode now, while this one plays, so
     // there's no load gap when the player actually gets there.
     const nextWave = WAVES[index + 1];
     if (nextWave) this.audio.preloadMusicCountry(nextWave.musicKey);
   }
 
+  // Run telemetry: reset at the start of every wave ATTEMPT (fresh wave,
+  // panic retry, or manual restart — see _applyWave/retryFromPanic/
+  // restartCurrentWave); read back the instant that attempt ends
+  // (_advanceWave for a pass, _onPanicResolved for a panic).
+  _resetWaveStats() {
+    this.threats.resetWaveStats();
+    this.radio.resetWaveStats();
+    this.fear.resetWaveStats();
+    this._mercyArmed = false;
+    this.threats.setMercyActive(false);
+  }
+
+  _logWaveSummary(outcome) {
+    const missiles = this.threats.getWaveStats();
+    const radioStats = this.radio.getWaveStats();
+    const fearStats = this.fear.getWaveStats();
+    const summary = {
+      country: WAVES[this.waveIndex].country,
+      outcome, // 'passed' | 'panicked'
+      timeSurvived: this.waveElapsed,
+      missilesLaunched: missiles.missilesLaunched,
+      missilesDodged: missiles.missilesDodged,
+      missilesHit: missiles.missilesHit,
+      fighterBurstsHit: missiles.fighterBurstsHit,
+      radioOffered: radioStats.callsOffered,
+      radioAnswered: radioStats.callsAnswered,
+      fearPeak: fearStats.peak,
+      fearAverage: fearStats.average,
+      topFearSource: fearStats.topSource,
+      topFearAmount: fearStats.topAmount,
+    };
+    this.lastWaveSummary = summary;
+    console.log(
+      `[telemetry] ${summary.country} — ${outcome.toUpperCase()} after ${summary.timeSurvived.toFixed(1)}s\n` +
+        `  missiles: ${summary.missilesLaunched} launched, ${summary.missilesDodged} dodged, ${summary.missilesHit} hit\n` +
+        `  fighter bursts taken: ${summary.fighterBurstsHit}\n` +
+        `  radio: ${summary.radioOffered} offered, ${summary.radioAnswered} answered\n` +
+        `  fear: peak ${summary.fearPeak.toFixed(1)}, avg ${summary.fearAverage.toFixed(1)}, ` +
+        `biggest contributor: ${summary.topFearSource ? `${summary.topFearSource} (+${summary.topFearAmount.toFixed(1)})` : '(none)'}`
+    );
+  }
+
   _advanceWave() {
+    this._logWaveSummary('passed');
     if (this.waveIndex >= WAVES.length - 1) {
       this._completeRoute();
       return;
@@ -373,6 +488,7 @@ export class Route {
   // (title/radio line/buttons); this phase only ends via retryFromPanic().
   _onPanicResolved() {
     if (this.phase !== 'flying') return;
+    this._logWaveSummary('panicked');
     this.threats.clearAllThreats();
     // clearAllThreats() wipes any in-flight scripted missile without ever
     // resolving through threats.js's _resolveHit/_resolveExpiry, so a
@@ -393,6 +509,7 @@ export class Route {
   // breathing-room calm window now that flying is actually resuming.
   retryFromPanic() {
     if (this.phase !== 'restart-flash') return;
+    this._resetWaveStats();
     this.waveElapsed = 0;
     this.phase = 'flying';
     this.threats.forceCalmFor(RESTART_CALM_DURATION);
@@ -407,6 +524,7 @@ export class Route {
     if (this.phase !== 'flying' && this.phase !== 'transition') return;
     this.threats.clearAllThreats();
     this.fear.value = 0;
+    this._resetWaveStats();
     this.waveElapsed = 0;
     this.phase = 'flying';
     this.threats.forceCalmFor(RESTART_CALM_DURATION);
